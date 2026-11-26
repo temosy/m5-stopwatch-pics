@@ -598,7 +598,6 @@ void loop() {
     screen_activity_at = now;
     if (screen_awake && focused) cycle_channel=true;
     if (panel_ready && !screen_awake) {
-      M5.Display.wakeup();
       M5.Display.setBrightness(screen_brightness);
       screen_awake = true;
       force_redraw = true;
@@ -609,7 +608,6 @@ void loop() {
   if (panel_ready && M5.BtnB.wasPressed()) {
     screen_activity_at=now;
     if (!screen_awake) {
-      M5.Display.wakeup();
       M5.Display.setBrightness(screen_brightness);
       screen_awake=true;
     }
@@ -626,7 +624,10 @@ void loop() {
   update_test(now);
   if (panel_ready && screen_awake && !test_active &&
       uint32_t(now - screen_activity_at) >= screen_timeout_ms) {
-    M5.Display.sleep();
+    // Show black before dimming the AMOLED. Keep the panel controller
+    // awake so the next button press need not exit hardware sleep.
+    M5.Display.fillScreen(0x0000);
+    M5.Display.setBrightness(0);
     screen_awake = false;
     Serial.printf("PICS auto display off scans=%lu ms=%lu\n",
                   (unsigned long)scan_cycles, (unsigned long)now);
