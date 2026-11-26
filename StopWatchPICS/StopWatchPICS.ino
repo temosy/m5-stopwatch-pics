@@ -13,6 +13,7 @@
 #include "pics_protocol.h"
 #include "system_kakari_mark.h"
 #include "test_chime.h"
+#include "photo_gallery.h"
 
 namespace {
 constexpr uint16_t fg = 0xffff, muted = 0x9cf3, panel = 0x1928, bg = 0x0864;
@@ -32,6 +33,51 @@ uint32_t focused_id = 0;
 bool focused = false;
 bool focused_demo = false;
 bool cycle_channel = false;
+
+int photo_page = 0;  // 0 is the normal PICS display.
+
+int gallery_swipe(uint32_t now) {
+  static bool tracking = false;
+  static uint16_t touch_id = 0;
+  static uint32_t started_at = 0;
+  const int count = M5.Touch.getCount();
+  if (count != 1) {
+    tracking = false;
+    return 0;
+  }
+  const auto& touch = M5.Touch.getDetail();
+  if (touch.wasPressed()) {
+    tracking = true;
+    touch_id = touch.id;
+    started_at = now;
+    return 0;
+  }
+  if (tracking && touch.id == touch_id && touch.wasReleased()) {
+    tracking = false;
+    return gallery::swipe_direction(touch.distanceX(), touch.distanceY(), now-started_at);
+  }
+  return 0;
+}
+
+void draw_gallery_photo(int page) {
+  const auto& photo = gallery::photos[page-1];
+  auto& d = M5.Display;
+  d.fillScreen(0x0000);
+  // Even origins keep AMOLED writes aligned.
+  const int x = ((d.width()-photo.width)/2) & ~1;
+  const int y = ((d.height()-photo.height)/2 - 12) & ~1;
+  const bool ok = d.drawJpg(photo.jpeg, photo.bytes, x, y);
+  char label[22];
+  snprintf(label, sizeof(label), "%d / %d", page, gallery::photo_count);
+  d.setFont(&lgfx::fonts::Font0);
+  d.setTextSize(2);
+  d.setTextColor(0xffff, 0x0000);
+  d.setTextDatum(lgfx::middle_center);
+  d.drawString(ok ? label : "Image error", d.width()/2, d.height()-44);
+  d.setTextDatum(lgfx::top_left);
+  Serial.printf("PICS gallery photo=%d/%d ok=%u\n", page, gallery::photo_count, unsigned(ok));
+}
+
 
 bool selectable(pics::State state) {
   return state==pics::State::Red || state==pics::State::Green ||
@@ -543,6 +589,7 @@ void setup() {
   M5.Display.setBrightness(screen_brightness);
   M5.Display.setFont(&lgfx::fonts::Font0);
   report_display();
+  if (gallery::photo_count) Serial.printf("PICS gallery ready photos=%d touch=%u\n", gallery::photo_count, unsigned(M5.Touch.isEnabled()));
   panel_ready = M5.Display.getBoard() == lgfx::board_M5StopWatch &&
                 M5.Display.width() > 0 && M5.Display.height() > 0;
   if (panel_ready) {
@@ -594,9 +641,22 @@ void loop() {
     start_retry = now + 1000;
   }
   bool force_redraw = false;
+  if (gallery::photo_count && panel_ready && M5.Touch.isEnabled()) {
+    const int direction = gallery_swipe(now);
+    if (direction && screen_awake && !test_active) {
+      photo_page = gallery::next_page(photo_page, direction, gallery::photo_count);
+      screen_activity_at = now;
+      force_redraw = true;
+      if (!photo_page) Serial.println("PICS gallery home");
+    }
+  }
   if (M5.BtnA.wasPressed()) {
     screen_activity_at = now;
-    if (screen_awake && focused) cycle_channel=true;
+    if (screen_awake && photo_page) {
+      photo_page = 0;
+      force_redraw = true;
+      Serial.println("PICS gallery home");
+    } else if (screen_awake && focused) cycle_channel=true;
     if (panel_ready && !screen_awake) {
       M5.Display.setBrightness(screen_brightness);
       screen_awake = true;
@@ -606,6 +666,7 @@ void loop() {
     }
   }
   if (panel_ready && M5.BtnB.wasPressed()) {
+    photo_page = 0;
     screen_activity_at=now;
     if (!screen_awake) {
       M5.Display.setBrightness(screen_brightness);
@@ -636,6 +697,14 @@ void loop() {
   if (panel_ready && screen_awake &&
       (force_redraw || uint32_t(millis() - battery_sample_at) >= 10000))
     banner_dirty=update_battery();
+  if (photo_page) {
+    // Skip the normal screen's painters, but keep scanning and accounting.
+    if (screen_awake && force_redraw) draw_gallery_photo(photo_page);
+    mascot_previous_ms=0;
+    mascot_stats_at=mascot_stats_frames=mascot_stats_max=mascot_stats_slow=0;
+    delay(5);
+    return;
+  }
   static uint32_t next_frame=0;
   if (screen_awake && (force_redraw || int32_t(now-next_frame)>=0)) {
     next_frame=now+80;

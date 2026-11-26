@@ -7,3 +7,7 @@ __pycache__/
 *.map
 *.log
 .env*
+
+# Local photos and generated gallery data (never publish).
+/StopWatchPICS/photo_gallery.local.h
+/local-photos/

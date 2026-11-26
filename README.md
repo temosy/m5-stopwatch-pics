@@ -45,6 +45,20 @@ arduino-cli upload -p "$PORT" --fqbn m5stack:esp32:m5stack_stopwatch \
   --input-dir "$PWD/build" "$PWD/StopWatchPICS"
 ```
 
+### 好きな写真を表示する（任意）
+
+公開リポジトリには写真データを含めていません。写真なしでも通常のPICSモニターとして動きます。写真を使う場合は、リポジトリのルートで次のように、表示順に画像ファイルを指定してから再ビルド・書き込みします。
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install Pillow
+.venv/bin/python tools/make-gallery.py /path/to/photo1.jpg /path/to/photo2.png
+```
+
+最大12枚。画像は丸いディスプレイに収まるよう、縦横比を保って縮小されます。左右のスワイプで通常画面と写真を順に切り替えます。写真表示中に黄色ボタンを押すと通常画面へ、青ボタンを押すと通常画面で模擬受信テストを開始します。消灯中は、まず黄色で画面を戻してください。写真表示中もBLEスキャンは続きます。
+
+写真は生成ファイル `StopWatchPICS/photo_gallery.local.h` と、そのファイルを使ってビルドしたファームウェアに埋め込まれます。元画像も含めて、GitHubや配布用ファームウェアには追加しないでください。写真なしへ戻すときは、生成ファイルを外して再ビルド・書き込みします。
+
 ### 時計を合わせる
 
 初回、または画面に「日時未設定」と出たら、書き込みモードを抜けて通常起動し、給電したままPCのシリアルモニターを閉じて実行します。PCの時計が正しいことを確認してください。時刻はUSBで設定し、StopWatchのRTCにはJSTで保存します。
