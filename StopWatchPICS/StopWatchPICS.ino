@@ -277,7 +277,10 @@ bool update_test(uint32_t now) {
 }
 portMUX_TYPE rx_lock = portMUX_INITIALIZER_UNLOCKED;
 std::atomic<bool> scan_done{false};
-bool start_pending = false;
+constexpr uint32_t scan_slice_seconds = 2;
+bool receiving = false;
+bool scan_in_flight = false;
+bool live_blue_held = false;
 uint32_t start_retry = 0;
 uint32_t scan_cycles = 0;
 uint32_t screen_activity_at = 0;
@@ -584,6 +587,52 @@ ScanReceiver adv_cb;
 
 void scanComplete(BLEScanResults) { scan_done.store(true); }
 
+void end_reception(const char* why) {
+  if (!receiving) return;
+  receiving = false;
+  portENTER_CRITICAL(&rx_lock);
+  receiver.reset();
+  portEXIT_CRITICAL(&rx_lock);
+  focused = false;
+  Serial.printf("PICS reception off reason=%s scans=%lu\n", why,
+                (unsigned long)scan_cycles);
+}
+
+bool begin_reception(uint32_t now) {
+  if (!scanner) {
+    if (!BLEDevice::init("")) {
+      Serial.println("PICS reception BLE init failed");
+      return false;
+    }
+    scanner = BLEDevice::getScan();
+    if (!scanner) return false;
+    scanner->setActiveScan(false);
+    scanner->setInterval(160);
+    scanner->setWindow(100);
+    scanner->setAdvertisedDeviceCallbacks(&adv_cb, true, false);
+  }
+  portENTER_CRITICAL(&rx_lock);
+  receiver.reset();
+  portEXIT_CRITICAL(&rx_lock);
+  receiving = true;
+  start_retry = now;
+  focused = false;
+  Serial.println("PICS reception on mode=manual");
+  return true;
+}
+
+void poll_reception(uint32_t now) {
+  if (scan_done.exchange(false)) {
+    scan_in_flight = false;
+    ++scan_cycles;
+  }
+  if (!receiving || scan_in_flight || int32_t(now-start_retry)<0) return;
+  // Repeat short passive scans until toggled off. Finish the in-flight slice
+  // naturally on off rather than racing a GAP stop against its completion.
+  scan_in_flight = scanner->start(scan_slice_seconds, scanComplete, false);
+  start_retry = now + (scan_in_flight ? 0 : 1000);
+}
+
 const char* signal_label(pics::State s) {
   switch (s) {
     case pics::State::NoSignal: return "NO SIGNAL";
@@ -754,7 +803,7 @@ void draw_button_help() {
   d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
   line(337, "赤：1回 起動・再起動／2回 電源オフ", 1, 0xfaaa);
   line(360, "黄：表示・切替／長押し：アラーム", 1, 0xffc8);
-  line(383, "青：受信テスト 開始・終了", 1, 0x86ff);
+  line(383, "青：短押しでテスト／長押しで受信切替", 1, 0x86ff);
   d.setFont(&lgfx::fonts::Font0);
 }
 
@@ -855,7 +904,7 @@ void draw(const pics::Snapshot& snap, bool blink_on=true) {
   if (snap.status == pics::Snapshot::Status::Single) {
     draw_focus(snap,blink_on);
     d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-    line(379,"黄：CH切替　青：受信テスト",1,0x86ff);
+    line(379,test_active ? "青：テスト終了" : "受信中・黄：CH切替",1,0x86ff);
     d.setFont(&lgfx::fonts::Font0);
   } else {
     if (test_active) {
@@ -864,9 +913,12 @@ void draw(const pics::Snapshot& snap, bool blink_on=true) {
       d.setFont(&lgfx::fonts::Font0);
     }
     d.setFont(&lgfx::fonts::lgfxJapanGothic_24);
-    line(215,snap.status==pics::Snapshot::Status::Multiple ? "複数の交差点" : "受信待ち",1,fg);
+    line(215,snap.status==pics::Snapshot::Status::Multiple ? "複数の交差点" :
+         (test_active || receiving) ? "受信待ち" : "受信オフ",1,fg);
     d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-    line(252,snap.status==pics::Snapshot::Status::Multiple ? "信号の個別表示を停止" : "新しいデータはありません",1,muted);
+    line(252,snap.status==pics::Snapshot::Status::Multiple ? "信号の個別表示を停止" :
+         test_active ? "新しいデータはありません" :
+         receiving ? "受信中" : "青の長押しで受信開始",1,muted);
     draw_button_help();
   }
   d.endWrite();
@@ -904,13 +956,7 @@ void setup() {
     update_power_source(elapsed_ms());
   }
   draw(pics::Snapshot{});
-  BLEDevice::init("");
-  scanner = BLEDevice::getScan();
-  scanner->setActiveScan(false);  // No broadcast, no scan requests.
-  scanner->setInterval(160);
-  scanner->setWindow(100);
-  scanner->setAdvertisedDeviceCallbacks(&adv_cb, true, false);  // Raw bytes; no cached scan results.
-  start_pending = true;
+  Serial.println("PICS reception standby BLE not initialized");
   screen_activity_at = millis();
 }
 void loop() {
@@ -924,23 +970,11 @@ void loop() {
   static uint32_t diag_at = 0;
   if ((int32_t)(now - diag_at) >= 0) {
     diag_at = now + 5000;
-    Serial.printf("PICS screen=%s scans=%lu ms=%lu\n", screen_awake ? "on" : "off",
-                  (unsigned long)scan_cycles, (unsigned long)now);
+    Serial.printf("PICS screen=%s scans=%lu rx=%u scan=%u ms=%lu\n",
+                  screen_awake ? "on" : "off", (unsigned long)scan_cycles,
+                  unsigned(receiving), unsigned(scan_in_flight), (unsigned long)now);
   }
-  if (scan_done.exchange(false)) {
-    ++scan_cycles;
-    start_pending = true;
-    start_retry = now;
-  }
-  if (start_pending && int32_t(now - start_retry) >= 0) {
-    start_pending = !scanner->start(2, scanComplete, false);
-    static bool logged_start = false;
-    if (!start_pending && !logged_start) {
-      Serial.println("PICS monitor: passive BLE scan started");
-      logged_start = true;
-    }
-    start_retry = now + 1000;
-  }
+  poll_reception(now);
   bool force_redraw = panel_ready && alarm_tick(now);
   bool alarm_ui_dirty = force_redraw;
   // A short yellow press keeps the old action. Hold it to open settings.
@@ -1047,26 +1081,36 @@ void loop() {
       } else if (screen_awake && focused) cycle_channel=true;
     }
   }
-  if (panel_ready && !swallow_blue && M5.BtnB.wasPressed()) {
-    photo_page = 0;
-    reset_gallery_gesture();
-    screen_activity_at=now;
-    if (!screen_awake) {
-      M5.Display.setBrightness(screen_brightness);
-      screen_awake=true;
+  if (panel_ready && !swallow_blue) {
+    if (M5.BtnB.wasPressed()) live_blue_held = false;
+    const bool blue_long = !live_blue_held && M5.BtnB.pressedFor(700);
+    const bool blue_short = !live_blue_held && M5.BtnB.wasReleased();
+    if (blue_long || blue_short) {
+      live_blue_held = blue_long;
+      photo_page = 0;
+      reset_gallery_gesture();
+      screen_activity_at=now;
+      if (!screen_awake) {
+        M5.Display.setBrightness(screen_brightness);
+        screen_awake=true;
+      }
+      if (blue_long) {
+        if (test_active) end_test();
+        if (receiving) end_reception("button");
+        else begin_reception(now);
+      } else if (test_active) end_test();
+      else {
+        test_receiver.reset();
+        test_active=true;
+        test_started_at=now;
+        test_step=-1;
+        Serial.println("PICS TEST begin");
+      }
+      force_redraw=true;
     }
-    if (test_active) end_test();
-    else {
-      test_receiver.reset();
-      test_active=true;
-      test_started_at=now;
-      test_step=-1;
-      Serial.println("PICS TEST begin");
-    }
-    force_redraw=true;
   }
   update_test(now);
-  if (panel_ready && screen_awake && !test_active &&
+  if (panel_ready && screen_awake && !test_active && !receiving &&
       uint32_t(now - screen_activity_at) >= screen_timeout_ms) {
     // Show black before dimming the AMOLED. Keep the panel controller
     // awake so the next button press need not exit hardware sleep.
@@ -1103,7 +1147,7 @@ void loop() {
     next_frame=now+80;
     pics::Snapshot s;
     if (test_active) s=test_receiver.view(now);
-    else {
+    else if (receiving) {
       portENTER_CRITICAL(&rx_lock);
       s=receiver.view(millis());
       portEXIT_CRITICAL(&rx_lock);
