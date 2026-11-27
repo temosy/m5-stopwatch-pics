@@ -2,6 +2,14 @@
 #include <M5Unified.h>
 #include <Preferences.h>
 #include <esp_timer.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
+#include "red_button.h"
+#include "oled_rail_trial.h"
+#include "oled_auto_record.h"
+#include "touch_button.h"
+#include "ui_fonts.h"
+#include "signal_mask.h"
 #include <time.h>
 #include <cmath>
 #include <algorithm>
@@ -15,6 +23,7 @@
 #include "test_chime.h"
 #include "photo_gallery.h"
 #include "daily_alarm.h"
+#include "local_weather.h"
 
 namespace {
 constexpr uint16_t fg = 0xffff, muted = 0x9cf3, panel = 0x1928, bg = 0x0864;
@@ -26,7 +35,9 @@ pics::Receiver test_receiver;
 bool test_active = false;
 uint32_t test_started_at = 0;
 int test_step = -1;
-constexpr uint32_t test_duration_ms = 21000;
+constexpr uint32_t test_stage_ms = 1000;
+constexpr int test_stage_count = 19;
+constexpr uint32_t test_duration_ms = test_stage_ms * test_stage_count;
 bool test_audio_ready=false, test_audio_pending=false;
 uint32_t test_audio_at=0;
 uint8_t selected_channel = 0;
@@ -54,13 +65,14 @@ struct GalleryGesture {
   int x = 0, y = 0;
   int dx = 0, dy = 0;
   bool drag_end = false;
+  int drawer = 0;  // 1: bottom swipe up, -1: swipe down.
 };
 
 GalleryGesture gallery_gesture(uint32_t now) {
   static bool tracking = false;
   static uint16_t touch_id = 0;
   static uint32_t started_at = 0;
-  static int last_x = 0, last_y = 0;
+  static int last_x = 0, last_y = 0, origin_x=0, origin_y=0;
   static bool dragging = false;
   if (M5.Touch.getCount() != 1) {
     tracking = false;
@@ -71,8 +83,8 @@ GalleryGesture gallery_gesture(uint32_t now) {
     tracking = true;
     touch_id = touch.id;
     started_at = now;
-    last_x = touch.x;
-    last_y = touch.y;
+    last_x = origin_x = touch.x;
+    last_y = origin_y = touch.y;
     dragging = false;
     return {};
   }
@@ -94,7 +106,9 @@ GalleryGesture gallery_gesture(uint32_t now) {
   return {gallery::swipe_direction(dx, dy, elapsed),
           touch.wasClicked() && elapsed <= 260 &&
               gallery::magnitude(dx) <= 16 && gallery::magnitude(dy) <= 16,
-          touch.x, touch.y};
+          touch.x, touch.y, 0, 0, false,
+          gallery::drawer_swipe(dx,dy,origin_x,origin_y,elapsed,
+                                M5.Display.width(),M5.Display.height())};
 }
 
 void release_zoom_cache() {
@@ -136,7 +150,7 @@ bool apply_gallery_tap(const GalleryGesture& g, uint32_t now) {
       : gallery::clamp_value((g.y-photo_view_y)/photo_scale, 0, p.height-1);
     photo_scale = gallery::step_zoom(photo_scale);
     pan_pending = false;
-    release_zoom_cache();
+    if (photo_scale == 1 || photo_scale == 2) release_zoom_cache();
     if (photo_scale > 1) {
       photo_view_x = gallery::zoom_origin(p.width, M5.Display.width(), source_x, photo_scale);
       photo_view_y = gallery::zoom_origin(p.height, photo_view_height(), source_y, photo_scale);
@@ -152,15 +166,20 @@ bool apply_gallery_tap(const GalleryGesture& g, uint32_t now) {
 
 bool draw_zoom_view(const gallery::Photo& p) {
   auto& d = M5.Display;
-  const auto* jpeg = photo_scale == 4 ? p.zoom4_jpeg : p.zoom_jpeg;
-  const size_t bytes = photo_scale == 4 ? p.zoom4_bytes : p.zoom_bytes;
-  if (cached_page != photo_page || cached_scale != photo_scale) {
+  // 8x reuses the 4x decode and scales only the visible area. An 8x
+  // full-image RGB565 sprite could exhaust the available PSRAM.
+  constexpr int decode_scale = 4;
+  const float ratio = float(photo_scale) / decode_scale;
+  const auto* jpeg = p.zoom4_jpeg;
+  const size_t bytes = p.zoom4_bytes;
+  if (cached_page != photo_page || cached_scale != decode_scale) {
     release_zoom_cache();
     cached_page = photo_page;
-    cached_scale = photo_scale;
+    cached_scale = decode_scale;
     zoom_sprite.setPsram(true);
     zoom_sprite.setColorDepth(16);
-    if (zoom_sprite.createSprite(p.width * photo_scale, p.height * photo_scale)) {
+    if (zoom_sprite.createSprite(p.width * decode_scale, p.height * decode_scale)) {
+      zoom_sprite.setPivot(0, 0);
       cached_success = zoom_sprite.drawJpg(jpeg, bytes, 0, 0);
       if (!cached_success) zoom_sprite.deleteSprite();
     }
@@ -168,8 +187,9 @@ bool draw_zoom_view(const gallery::Photo& p) {
   d.setClipRect(0, 0, d.width(), photo_view_height());
   const int x = photo_view_x & ~1, y = photo_view_y & ~1;
   bool ok = true;
-  if (cached_success) zoom_sprite.pushSprite(&d, x, y);
-  else ok = d.drawJpg(jpeg, bytes, x, y);
+  if (cached_success && ratio == 1) zoom_sprite.pushSprite(&d, x, y);
+  else if (cached_success) zoom_sprite.pushRotateZoom(&d, x, y, 0, ratio, ratio);
+  else ok = d.drawJpg(jpeg, bytes, x, y, 0, 0, 0, 0, float(ratio), float(ratio));
   d.clearClipRect();
   return ok;
 }
@@ -197,8 +217,8 @@ void draw_gallery_photo(int page) {
   char label[22];
   if (photo_scale == 1) snprintf(label, sizeof(label), "%d / %d", page, gallery::photo_count);
   else snprintf(label, sizeof(label), "%d / %d  %dx", page, gallery::photo_count, photo_scale);
-  d.setFont(&lgfx::fonts::Font0);
-  d.setTextSize(2);
+  d.setFont(ui_fonts::body.get());
+  d.setTextSize(1);
   d.setTextColor(0xffff, 0x0000);
   d.setTextDatum(lgfx::middle_center);
   d.drawString(ok ? label : "Image error", d.width()/2, d.height()-44);
@@ -228,7 +248,7 @@ bool feed_test_report(uint8_t step,uint32_t now) {
   const uint8_t state=step<8 ? 1 : step<16 ? 3 : 2;
   const uint8_t level=step<8 ? 7-step : step<16 ? 15-step : 18-step;
   p[14]=(level<<4)|state;
-  p[15]=((7-level)<<4)|(state==1 ? 3 : 1);
+  p[15]=(level<<4)|(state==1 ? 3 : 1);
   p[16]=0x84; p[17]=0x84; p[18]=0x84; p[19]=0x84;
   pics::Report frame;
   if (!pics::parse_ad(p,sizeof(p),frame)) return false;
@@ -259,8 +279,8 @@ bool update_test(uint32_t now) {
   }
   const uint32_t age=now-test_started_at;
   if (age>=test_duration_ms) { end_test();return true; }
-  const int step=int(age/800);
-  if (step>=19 || step==test_step) return false;
+  const int step=int(age/test_stage_ms);
+  if (step>=test_stage_count || step==test_step) return false;
   test_step=step;
   const bool decoded=feed_test_report(uint8_t(step),now);
   if (step==0 || step==8 || step==16) {
@@ -286,12 +306,39 @@ uint32_t scan_cycles = 0;
 uint32_t screen_activity_at = 0;
 bool screen_awake = true;
 bool panel_ready = false;
+bool oled_auto_active=false;
+bool oled_auto_blocked=false;
+void save_oled_probe();
+void save_oled_auto();
+bool wake_screen() {
+  if (oled_rail_trial::inactive()) {
+    if (!oled_rail_trial::wake(screen_brightness)) {
+      if(oled_auto_active) {
+        oled_auto_blocked=true;
+        Serial.printf("PICS OLED auto wake failed error=%u\n",unsigned(oled_rail_trial::probe.error));
+        save_oled_auto();
+      }
+      save_oled_probe(); return false;
+    }
+    if(oled_auto_active) {
+      Serial.printf("PICS OLED auto wake ok=%lu ms\n",(unsigned long)oled_rail_trial::probe.wake_ms);
+      if (oled_rail_trial::probe.error==oled_rail_trial::WakeFailed)
+        oled_rail_trial::probe.error=oled_rail_trial::NoError;
+      save_oled_auto();
+      oled_auto_active=false;
+    }
+    save_oled_probe();
+  }
+  M5.Display.setBrightness(screen_brightness);
+  screen_awake=true;
+  return true;
+}
 int battery_percent = -1;
 uint32_t battery_sample_at = 0;
 
 enum class PowerSource : uint8_t { Unknown, Battery, External };
 constexpr uint32_t endurance_tag = 0x45525431;
-struct EnduranceRecord {
+struct LegacyEndurance {
   uint32_t tag = endurance_tag;
   uint32_t last_seconds = 0;
   uint32_t checkpoint_seconds = 0;
@@ -300,11 +347,69 @@ struct EnduranceRecord {
   uint8_t active = 0;
   uint8_t reserved = 0;
 };
-static_assert(sizeof(EnduranceRecord) == 16);
+static_assert(sizeof(LegacyEndurance)==16);
+struct Activity {
+  uint32_t screen=0, ble=0, wifi=0, speaker=0, idle=0, led=0;
+  bool sample_seen=false;
+};
+struct EnduranceRecord : LegacyEndurance {
+  Activity live{}, last{};
+};
 Preferences endurance_store;
 EnduranceRecord endurance;
 bool endurance_can_save = false;
+uint32_t oled_attempts=0;
+uint32_t oled_auto_sequence=0;
+uint64_t oled_auto_last=0;
+bool oled_auto_usb=false;
+void log_oled_auto(uint64_t raw) {
+  if(!oled_auto_record::valid(raw)) return;
+  const auto d=oled_auto_record::decode(raw);
+  Serial.printf("PICS OLED auto record seq=%lu off=%u wake=%u rail_ms=%lu wake_ms=%lu error=%u supply=%s\n",
+      (unsigned long)d.seq,unsigned(bool(d.flags&2)),unsigned(bool(d.flags&4)),
+      (unsigned long)d.rail_ms,(unsigned long)d.wake_ms,unsigned(d.error),d.usb?"usb":"battery");
+}
+void save_oled_auto() {
+  if(!oled_auto_sequence) return;
+  const auto& p=oled_rail_trial::probe;
+  const uint64_t raw=oled_auto_record::encode({oled_auto_sequence,p.rail_ms,p.wake_ms,p.flags,p.error,oled_auto_usb});
+  if(raw!=oled_auto_last) {
+    if(endurance_can_save && endurance_store.putULong64("oled_auto1",raw)==sizeof(raw))
+      oled_auto_last=raw;
+    else Serial.println("PICS OLED auto record storage unavailable");
+  }
+  log_oled_auto(raw);
+}
+void load_oled_auto() {
+  if(!endurance_can_save) return;
+  const uint64_t raw=endurance_store.getULong64("oled_auto1",0);
+  if(!oled_auto_record::valid(raw)) return;
+  oled_auto_last=raw;
+  oled_auto_sequence=oled_auto_record::decode(raw).seq;
+  log_oled_auto(raw);
+}
+void log_oled_probe(const oled_rail_trial::Probe& p) {
+  if(p.tag!=oled_rail_trial::probe_tag || !p.attempt) return;
+  Serial.printf("PICS OLED detail seq=%lu button=%u error=%u latch=%02x flags=%u blank=%lu rail=%lu wake=%lu\n",
+      (unsigned long)p.attempt,unsigned(p.button),unsigned(p.error),unsigned(p.latch),
+      unsigned(p.flags),(unsigned long)p.blank_ms,(unsigned long)p.rail_ms,(unsigned long)p.wake_ms);
+}
+void save_oled_probe() {
+  const auto& p=oled_rail_trial::probe;
+  if(p.attempt && endurance_can_save) endurance_store.putBytes("oled_detail2",&p,sizeof(p));
+  log_oled_probe(p);
+}
 uint64_t battery_started_ms = 0;
+uint32_t battery_before_boot = 0;
+bool endurance_resume_pending = false, endurance_approx = false;
+RedButton red_button;
+bool red_policy_ready = false;
+PowerSource red_policy_source = PowerSource::Unknown;
+uint32_t next_red_poll = 0;
+uint64_t usage_sample_ms=0;
+bool usage_view=false, help_view=false;
+bool led_enabled=true;
+PowerSource led_policy_source=PowerSource::Unknown;
 PowerSource power_source = PowerSource::Unknown;
 PowerSource source_candidate = PowerSource::Unknown;
 uint8_t source_votes = 0;
@@ -314,9 +419,19 @@ bool clock_set_jst = false;
 constexpr uint8_t rx8130_address = 0x32, rx8130_flag = 0x1D;
 constexpr uint32_t rtc_i2c_hz = 100000;
 char clock_label[34] = "日時未設定（JST）";
-
+constexpr const char* weekdays[]={"日","月","火","水","木","金","土"};
+constexpr int weekday_of(int y,int m,int d) {
+  constexpr int offset[]={0,3,2,5,0,3,5,1,4,6,2,4};
+  if (m<1 || m>12 || d<1 || d>31) return -1;
+  if (m<3) --y;
+  return (y+y/4-y/100+y/400+offset[m-1]+d)%7;
+}
+static_assert(weekday_of(2026,11,27)==5 && weekday_of(2028,2,29)==2 &&
+              weekday_of(2027,1,1)==5 && weekday_of(2026,0,1)==-1);
+int clock_weekday=-1;
 bool read_clock() {
   m5::rtc_datetime_t dt;
+  clock_weekday=-1;
   uint8_t flags = 0;
   if (!clock_set_jst || !M5.Rtc.isEnabled() ||
       !M5.In_I2C.readRegister(rx8130_address, rx8130_flag, &flags, 1, rtc_i2c_hz) ||
@@ -325,15 +440,125 @@ bool read_clock() {
     snprintf(clock_label, sizeof(clock_label), "日時未設定（JST）");
     return false;
   }
+  clock_weekday=weekday_of(dt.date.year,dt.date.month,dt.date.date);
   snprintf(clock_label, sizeof(clock_label), "%04d/%02d/%02d %02d:%02d:%02d",
       int(dt.date.year),int(dt.date.month),int(dt.date.date),int(dt.time.hours),
       int(dt.time.minutes),int(dt.time.seconds));
   return true;
 }
 
+wifi_profiles::Book wifi_book;
+int wifi_preferred=-1;
+bool have_wifi() { return wifi_profiles::count(wifi_book)>0; }
+bool wifi_busy() { return local_weather::read().status==local_weather::Result::Busy; }
+local_weather::Result last_home_weather;
+bool weather_view=false, weather_clock_applied=true;
+local_weather::Result::Status weather_drawn=local_weather::Result::Idle;
+
+bool save_clock_epoch(uint64_t epoch) {
+  if (epoch<1735689600ULL || epoch>=4102416000ULL) return false;
+  const time_t in_jst=time_t(epoch+9*3600);
+  tm value={};
+  if (!gmtime_r(&in_jst,&value) || !M5.Rtc.setDateTime(&value) ||
+      !M5.In_I2C.writeRegister8(rx8130_address,rx8130_flag,0xBD,rtc_i2c_hz))
+    return false;
+  clock_set_jst=true;
+  if (endurance_can_save) endurance_store.putBool("clock_jst",true);
+  return read_clock();
+}
+int hex_digit(char c) {
+  if (c>='0' && c<='9') return c-'0';
+  if (c>='a' && c<='f') return c-'a'+10;
+  if (c>='A' && c<='F') return c-'A'+10;
+  return -1;
+}
+bool decode_hex(const char* in, char* out, size_t cap, size_t minimum) {
+  const size_t n=strlen(in);
+  if (n%2 || n/2>=cap || n/2<minimum) return false;
+  for (size_t i=0;i<n/2;++i) {
+    const int hi=hex_digit(in[2*i]), lo=hex_digit(in[2*i+1]);
+    if (hi<0 || lo<0 || (hi==0 && lo==0)) return false;
+    out[i]=char(hi*16+lo);
+  }
+  out[n/2]=0;
+  return true;
+}
+bool save_wifi_book(const wifi_profiles::Book& book) {
+  if (!endurance_can_save || wifi_busy() || local_weather::scanning() ||
+      !wifi_profiles::valid_book(book) ||
+      endurance_store.putBytes("wifi_book1",&book,sizeof(book))!=sizeof(book)) return false;
+  wifi_book=book;
+  if (endurance_store.isKey("wifi_cfg")) endurance_store.remove("wifi_cfg");
+  wifi_preferred=-1;
+  last_home_weather={};
+  local_weather::publish(local_weather::Result{});
+  weather_clock_applied=true;
+  return true;
+}
+bool configure_network(const char* text) {
+  if (!endurance_can_save || local_weather::read().status==local_weather::Result::Busy) return false;
+  int lat=0,lon=0,used=0;
+  char ssid[65]{}, pass[127]{}, city[65]{};
+  const bool parsed=sscanf(text,"%d %d %64s %126s %64s%n",&lat,&lon,ssid,pass,city,&used)==5;
+  local_weather::Settings cfg;
+  const bool good=parsed && !text[used] && lat>=-9000 && lat<=9000 &&
+      lon>=-18000 && lon<=18000 && decode_hex(ssid,cfg.ssid,sizeof(cfg.ssid),1) &&
+      decode_hex(pass,cfg.password,sizeof(cfg.password),8) &&
+      decode_hex(city,cfg.label,sizeof(cfg.label),1);
+  if (good) { cfg.lat=lat; cfg.lon=lon; }
+  auto next=wifi_book;
+  int index=wifi_profiles::find(next,cfg.ssid);
+  if(index<0) index=wifi_profiles::empty(next);
+  const bool saved=good && wifi_profiles::set(next,index,{cfg,0}) && save_wifi_book(next);
+  wifi_profiles::wipe(pass,sizeof(pass));
+  wifi_profiles::wipe(cfg.password,sizeof(cfg.password));
+  wifi_profiles::wipe(&next,sizeof(next));
+  return saved;
+}
+const char* wifi_radio_state() {
+  wifi_mode_t mode=WIFI_MODE_NULL;
+  const auto status=esp_wifi_get_mode(&mode);
+  if(status==ESP_ERR_WIFI_NOT_INIT) return "off";
+  if(status!=ESP_OK) return "unknown";
+  return mode==WIFI_MODE_NULL ? "off" : mode==WIFI_MODE_STA ? "sta" : "other";
+}
+const char* source_name(PowerSource source) {
+  return source==PowerSource::External ? "usb" :
+         source==PowerSource::Battery ? "battery" : "unknown";
+}
+bool start_weather(const char* reason) {
+  if (!local_weather::start(wifi_book,wifi_preferred)) return false;
+  if (wifi_profiles::count(wifi_book)>1) last_home_weather={};
+  weather_clock_applied=false;
+  Serial.printf("PICS network update started reason=%s\n",reason);
+  return true;
+}
+void poll_weather() {
+  if (weather_clock_applied) return;
+  const auto r=local_weather::read();
+  if (r.status==local_weather::Result::Busy) return;
+  weather_clock_applied=true;
+  if (r.profile>=0 && r.epoch) wifi_preferred=r.profile;
+  if (r.status==local_weather::Result::Ready) {
+    last_home_weather=r;
+    Serial.printf("PICS home weather ready code=%d temp10=%d\n",r.code,r.temperature_tenths);
+    if (r.next_code>=0)
+      Serial.printf("PICS tomorrow date=%s code=%d min10=%d max10=%d\n",
+          r.forecast_date,r.next_code,r.next_min_tenths,r.next_max_tenths);
+  }
+  if (r.epoch) {
+    const time_t now=time(nullptr);
+    if (now>=r.epoch && now-r.epoch<120 && save_clock_epoch(uint64_t(now)))
+      Serial.printf("PICS clock network set %s JST\n",clock_label);
+    else Serial.println("PICS clock network set failed");
+  }
+  Serial.printf("PICS network status=%u weather=%u\n",unsigned(r.status),
+                unsigned(r.status==local_weather::Result::Ready));
+}
+
 void poll_clock_command() {
-  static char line[32];
-  static uint8_t len = 0;
+  static char line[296];
+  static uint16_t len = 0;
   static bool overflow = false;
   for (int budget=48; budget>0 && Serial.available(); --budget) {
     const int c=Serial.read();
@@ -348,19 +573,21 @@ void poll_clock_command() {
           if (line[i]<'0' || line[i]>'9') { digits=false; break; }
           epoch=epoch*10+(line[i]-'0');
         }
-        if (digits && epoch>=1735689600ULL && epoch<4102416000ULL) {
-          const time_t in_jst=time_t(epoch+9*3600);
-          tm value={};
-          if (gmtime_r(&in_jst,&value) && M5.Rtc.setDateTime(&value) &&
-              M5.In_I2C.writeRegister8(rx8130_address,rx8130_flag,0xBD,rtc_i2c_hz)) {
-            // Flag register is W0C: preserve other flags and clear only VLF.
-            clock_set_jst=true;
-            if (endurance_can_save) endurance_store.putBool("clock_jst",true);
-            if (read_clock()) Serial.printf("PICS clock set %s JST\n",clock_label);
-            else Serial.println("PICS clock readback failed");
-          } else Serial.println("PICS clock set failed");
-        }
+        if (digits && save_clock_epoch(epoch)) Serial.printf("PICS clock set %s JST\n",clock_label);
+        else Serial.println("PICS clock set failed");
+      } else if (!overflow && !memcmp(line,"NETCFG ",7) && len>7 &&
+                 power_source==PowerSource::External) {
+        if (configure_network(line+7)) {
+          Serial.println("PICS network configuration saved");
+          start_weather("usb-config");
+        } else Serial.println("PICS network configuration rejected");
+      } else if (!overflow && len==9 && !memcmp(line,"NETFORGET",9) &&
+                 power_source==PowerSource::External && endurance_can_save &&
+                 local_weather::read().status!=local_weather::Result::Busy) {
+        const bool ok=save_wifi_book(wifi_profiles::Book{});
+        Serial.println(ok ? "PICS network configuration removed" : "PICS network configuration rejected");
       }
+      memset(line,0,len+1);
       len=0; overflow=false;
     } else if (c>=0 && len<sizeof(line)-1) line[len++]=char(c);
     else overflow=true;
@@ -381,6 +608,12 @@ unsigned alarm_tone_index = 0;
 
 void load_alarm() {
   if (endurance_can_save) {
+    // Local device setup requested by the owner. Later menu choices persist.
+    if (!endurance_store.getBool("alarm7max_v1",false)) {
+      if (endurance_store.putUShort("alarm_cfg",alarm_setting) == sizeof(alarm_setting)) {
+        endurance_store.putBool("alarm7max_v1",true);
+      } else Serial.println("PICS alarm provision failed");
+    }
     const uint16_t stored = endurance_store.getUShort("alarm_cfg", alarm_setting);
     if (daily_alarm::minutes_of(stored) < 1440) alarm_setting = stored;
     alarm_last_day = endurance_store.getUInt("alarm_day", 0);
@@ -424,8 +657,7 @@ void begin_alarm(uint32_t now, bool preview) {
   M5.Speaker.setVolume(alarm_volume);
   M5.Speaker.setChannelVolume(0,255);
   alarm_audio = M5.Speaker.begin();
-  M5.Display.setBrightness(screen_brightness);
-  screen_awake = true;
+  wake_screen();
   screen_activity_at = now;
   Serial.printf("PICS alarm %s speaker=%u\n", preview ? "preview" : "ring", unsigned(alarm_audio));
 }
@@ -472,7 +704,7 @@ uint64_t elapsed_ms() { return uint64_t(esp_timer_get_time()) / 1000; }
 
 bool save_endurance() {
   if (!endurance_can_save) return false;
-  const bool ok = endurance_store.putBytes("record", &endurance, sizeof(endurance))
+  const bool ok = endurance_store.putBytes("record_v2", &endurance, sizeof(endurance))
                   == sizeof(endurance);
   if (!ok) Serial.println("PICS endurance save failed");
   return ok;
@@ -484,75 +716,210 @@ void load_endurance() {
     Serial.println("PICS endurance storage unavailable");
     return;
   }
-  if (endurance_store.getBytesLength("record") == sizeof(endurance)) {
+  if (endurance_store.getBytesLength("record_v2")==sizeof(endurance)) {
     EnduranceRecord loaded;
-    if (endurance_store.getBytes("record", &loaded, sizeof(loaded)) == sizeof(loaded) &&
-        loaded.tag == endurance_tag) endurance = loaded;
+    if (endurance_store.getBytes("record_v2",&loaded,sizeof(loaded))==sizeof(loaded) &&
+        loaded.tag==endurance_tag) endurance=loaded;
+  } else if (endurance_store.getBytesLength("record")==sizeof(LegacyEndurance)) {
+    LegacyEndurance loaded;
+    if (endurance_store.getBytes("record",&loaded,sizeof(loaded))==sizeof(loaded) &&
+        loaded.tag==endurance_tag) static_cast<LegacyEndurance&>(endurance)=loaded;
   }
-  if (endurance.active) {
-    endurance.last_seconds = endurance.checkpoint_seconds;
-    endurance.last_valid = true;
-    endurance.last_interrupted = true;
-    endurance.active = false;
-    endurance.checkpoint_seconds = 0;
-    save_endurance();
+  endurance_resume_pending=endurance.active;
+  if (endurance_resume_pending) {
+    battery_before_boot=endurance.checkpoint_seconds;
+    endurance_approx=(endurance.reserved!=1);
   }
   clock_set_jst = endurance_store.getBool("clock_jst", false);
+  if (endurance_store.isKey("wifi_book1")) {
+    wifi_profiles::Book loaded;
+    if (endurance_store.getBytesLength("wifi_book1")==sizeof(loaded) &&
+        endurance_store.getBytes("wifi_book1",&loaded,sizeof(loaded))==sizeof(loaded) &&
+        wifi_profiles::valid_book(loaded)) wifi_book=loaded;
+    wifi_profiles::wipe(&loaded,sizeof(loaded));
+  } else {
+    local_weather::Settings old;
+    if (endurance_store.getBytesLength("wifi_cfg")==sizeof(old) &&
+        endurance_store.getBytes("wifi_cfg",&old,sizeof(old))==sizeof(old))
+      wifi_profiles::set(wifi_book,0,{old,0});
+    wifi_profiles::wipe(&old,sizeof(old));
+  }
   Serial.printf("PICS endurance ready last_valid=%u last_s=%lu interrupted=%u\n",
       unsigned(endurance.last_valid), (unsigned long)endurance.last_seconds,
       unsigned(endurance.last_interrupted));
 }
 
 uint32_t battery_run_seconds(uint64_t now) {
-  return endurance.active ? uint32_t((now - battery_started_ms) / 1000) : 0;
+  if (!endurance.active) return 0;
+  if (endurance_resume_pending || now<battery_started_ms) return battery_before_boot;
+  return battery_before_boot+uint32_t((now-battery_started_ms)/1000);
+}
+
+int read_vin_mv() {
+  uint8_t raw[2];
+  return M5.Power.M5pm1.readRegister(0x24,raw,sizeof(raw))
+           ? int(raw[0])+(int(raw[1])<<8) : -1;
+}
+PowerSource classify_vin(int mv) {
+  if (mv>=4200 && mv<6000) return PowerSource::External;
+  if (mv>=0 && mv<=2000) return PowerSource::Battery;
+  return PowerSource::Unknown;
+}
+void finish_battery_run(uint64_t now,bool approximate) {
+  if (!endurance.active) return;
+  endurance.last_seconds=battery_run_seconds(now);
+  endurance.last=endurance.live;
+  endurance.live={};
+  endurance.last_valid=true;
+  endurance.last_interrupted=approximate;
+  endurance.active=false;
+  endurance.checkpoint_seconds=0;
+  endurance.reserved=0;
+  endurance_resume_pending=false;
+  battery_before_boot=0;
+  save_endurance();
+  Serial.printf("PICS endurance finish last_s=%lu interrupted=%u\n",
+                (unsigned long)endurance.last_seconds,unsigned(approximate));
+  if (endurance.last.sample_seen) {
+    const auto& a=endurance.last;
+    Serial.printf("PICS usage ms screen=%lu ble=%lu wifi=%lu audio=%lu idle=%lu led=%lu\n",
+        (unsigned long)a.screen,(unsigned long)a.ble,(unsigned long)a.wifi,
+        (unsigned long)a.speaker,(unsigned long)a.idle,(unsigned long)a.led);
+  }
+}
+// Official M5PM1 BTN_CFG_1 bit 0 disables short reset, BTN_CFG_2 bit 0
+// disables double-click off. Never modify BTN_CFG_1 bit 7 (download lock).
+bool apply_red_policy(bool battery) {
+  auto& pm=M5.Power.M5pm1;
+  constexpr uint8_t cfg1=0x49,cfg2=0x4a,mask=1;
+  uint8_t old1=0,old2=0,got1=0,got2=0;
+  if (!pm.readRegister(cfg1,&old1,1) || !pm.readRegister(cfg2,&old2,1)) return false;
+  const uint8_t new1=(old1&~mask)|(battery?mask:0);
+  const uint8_t new2=(old2&~mask)|(battery?mask:0);
+  if ((new1==old1 || pm.writeRegister8(cfg1,new1)) &&
+      (new2==old2 || pm.writeRegister8(cfg2,new2)) &&
+      pm.readRegister(cfg1,&got1,1) && pm.readRegister(cfg2,&got2,1) &&
+      got1==new1 && got2==new2) return true;
+  if (new2!=old2) pm.writeRegister8(cfg2,old2);
+  if (new1!=old1) pm.writeRegister8(cfg1,old1);
+  return false;
+}
+void poll_red_button(uint32_t now,uint64_t run_ms) {
+  if (!red_policy_ready || red_policy_source!=PowerSource::Battery ||
+      power_source!=PowerSource::Battery || int32_t(now-next_red_poll)<0) return;
+  next_red_poll=now+20;
+  uint8_t raw=0;
+  if (!M5.Power.M5pm1.readRegister(0x48,&raw,1)) { red_button.reset(); return; }
+  const auto action=red_button.sample(raw&1,now);
+  if (action==RedButton::None || classify_vin(read_vin_mv())!=PowerSource::Battery) return;
+  if (action==RedButton::ShutDown) {
+    const auto prior=endurance;
+    const auto prior_offset=battery_before_boot;
+    const bool approx=endurance_approx;
+    finish_battery_run(run_ms,approx);
+    Serial.println("PICS red shutdown");
+    if (!M5.Power.M5pm1.powerOff()) {
+      endurance=prior;
+      // Continue the old session if the shutdown command was rejected.
+      battery_before_boot=prior_offset;
+      endurance_resume_pending=false;
+      endurance_approx=approx;
+      save_endurance();
+      Serial.println("PICS red shutdown failed");
+    }
+  } else {
+    if (endurance.active) {
+      endurance.checkpoint_seconds=battery_run_seconds(run_ms);
+      endurance.reserved=endurance_approx ? 0 : 1;
+      save_endurance();
+    }
+    Serial.printf("PICS red reboot checkpoint_s=%lu\n",(unsigned long)endurance.checkpoint_seconds);
+    esp_restart();
+  }
+}
+
+void sample_activity(uint64_t now) {
+  if (!usage_sample_ms) { usage_sample_ms=now; return; }
+  if (now-usage_sample_ms<100) return;
+  const uint32_t dt=uint32_t(std::min<uint64_t>(now-usage_sample_ms,1000));
+  usage_sample_ms=now;
+  if (!dt || power_source!=PowerSource::Battery || !endurance.active || endurance_resume_pending) return;
+  const bool wifi=wifi_busy() || local_weather::scanning();
+  const bool audio=test_audio_ready || alarm_audio;
+  auto& live=endurance.live;
+  live.sample_seen=true;
+  if (screen_awake) live.screen+=dt;
+  if (scan_in_flight) live.ble+=dt;
+  if (wifi) live.wifi+=dt;
+  if (audio) live.speaker+=dt;
+  if (led_enabled) live.led+=dt;
+  if (!screen_awake && !scan_in_flight && !wifi && !audio) live.idle+=dt;
 }
 
 void update_power_source(uint64_t now) {
   if (now < next_source_sample_ms) return;
-  next_source_sample_ms = now + 1000;
-  uint8_t raw[2];
-  // StopWatch M5PM1 VIN ADC (0x24-0x25); retain I2C error vs a real zero.
-  const bool ok = M5.Power.M5pm1.readRegister(0x24, raw, sizeof(raw));
-  const int vin_mv = ok ? int(raw[0]) + (int(raw[1]) << 8) : -1;
-  const PowerSource measured = vin_mv >= 4200 && vin_mv < 6000 ? PowerSource::External :
-      (vin_mv >= 0 && vin_mv <= 2000 ? PowerSource::Battery : PowerSource::Unknown);
-  if (measured == PowerSource::Unknown || measured == power_source) {
-    source_candidate = PowerSource::Unknown;
-    source_votes = 0;
+  next_source_sample_ms=now+1000;
+  const int vin_mv=read_vin_mv();
+  const auto measured=classify_vin(vin_mv);
+  if (measured==PowerSource::Unknown || measured==power_source) {
+    source_candidate=PowerSource::Unknown;
+    source_votes=0;
   } else {
-    if (measured != source_candidate) {
-      source_candidate = measured;
-      source_candidate_ms = now;
-      source_votes = 1;
-    } else if (++source_votes >= 3) {
-      power_source = measured;
-      source_votes = 0;
-      if (power_source == PowerSource::Battery) {
-        battery_started_ms = source_candidate_ms;
-        endurance.active = true;
-        endurance.checkpoint_seconds = 0;
-        save_endurance();
-        Serial.printf("PICS endurance battery start vin=%d\n", vin_mv);
-      } else {
-        if (endurance.active) {
-          endurance.last_seconds = battery_run_seconds(source_candidate_ms);
-          endurance.last_valid = true;
-          endurance.last_interrupted = false;
-          endurance.active = false;
-          endurance.checkpoint_seconds = 0;
-          save_endurance();
-          Serial.printf("PICS endurance finish last_s=%lu vin=%d\n",
-                        (unsigned long)endurance.last_seconds, vin_mv);
-        } else {
-          Serial.printf("PICS endurance USB vin=%d\n", vin_mv);
+    if (measured!=source_candidate) {
+      source_candidate=measured;
+      source_candidate_ms=now;
+      source_votes=1;
+    } else if (++source_votes>=3) {
+      power_source=measured;
+      source_votes=0;
+      if (power_source==PowerSource::Battery) {
+        battery_started_ms=source_candidate_ms;
+        if (!endurance_resume_pending) {
+          battery_before_boot=0;
+          endurance_approx=false;
+          endurance.checkpoint_seconds=0;
+          endurance.live={};
         }
+        endurance.active=true;
+        endurance.reserved=0;
+        endurance_resume_pending=false;
+        save_endurance();
+        Serial.printf("PICS endurance battery vin=%d resumed_s=%lu\n",vin_mv,(unsigned long)battery_before_boot);
+      } else if (endurance.active) {
+        finish_battery_run(source_candidate_ms,endurance_resume_pending || endurance_approx);
+      } else {
+        Serial.printf("PICS endurance USB vin=%d\n",vin_mv);
       }
     }
   }
-  if (endurance.active && measured == PowerSource::Battery) {
-    const uint32_t secs = battery_run_seconds(now);
-    if (secs - endurance.checkpoint_seconds >= 60) {
-      endurance.checkpoint_seconds = secs;
+  if (power_source!=PowerSource::Unknown && measured==power_source &&
+      (!red_policy_ready || red_policy_source!=power_source)) {
+    red_button.reset();
+    red_policy_ready=apply_red_policy(power_source==PowerSource::Battery);
+    red_policy_source=power_source;
+    Serial.printf("PICS red policy battery=%u verified=%u\n",
+                  unsigned(power_source==PowerSource::Battery),unsigned(red_policy_ready));
+  }
+  if (power_source!=PowerSource::Unknown && measured==power_source &&
+      led_policy_source!=power_source) {
+    auto& pm=M5.Power.M5pm1;
+    const bool desired=power_source==PowerSource::External;
+    uint8_t cfg=0;
+    if (pm.readRegister(0x06,&cfg,1)) {
+      const bool already=bool(cfg&0x10)==desired;
+      if (already || (pm.setLedEnLevel(desired) && pm.readRegister(0x06,&cfg,1) &&
+                      bool(cfg&0x10)==desired)) {
+        led_policy_source=power_source;
+        led_enabled=desired;
+        Serial.printf("PICS status LED battery=%u enabled=%u verified=1\n",
+                      unsigned(!desired),unsigned(desired));
+      }
+    }
+  }
+  if (endurance.active && !endurance_resume_pending && measured==PowerSource::Battery) {
+    const uint32_t secs=battery_run_seconds(now);
+    if (secs>=endurance.checkpoint_seconds && secs-endurance.checkpoint_seconds>=60) {
+      endurance.checkpoint_seconds=secs;
       save_endurance();
     }
   }
@@ -647,51 +1014,146 @@ const char* signal_label(pics::State s) {
 void line(int y, const char* content, uint8_t size, uint16_t color = fg) {
   auto& d = M5.Display;
   d.setTextDatum(lgfx::textdatum_t::middle_center);
-  d.setTextColor(color);
+  d.setTextColor(color,bg);
   d.setTextSize(size);
   d.drawString(content, d.width()/2, y);
 }
 
-void alarm_tile(int x, int y, int w, const char* label, uint16_t color) {
+// One visual language for touch actions; physical-button instructions stay as text.
+void draw_button(TouchButton box,const char* label,uint16_t color=fg,bool enabled=true,bool large=false) {
   auto& d=M5.Display;
-  d.fillRoundRect(x,y,w,48,12,panel);
-  d.setFont(&lgfx::fonts::lgfxJapanGothicP_24);
+  const uint16_t fill=enabled ? panel : 0x10e6;
+  const uint16_t border=enabled ? 0x4b34 : 0x294a;
+  const int radius=box.h<=33 ? 8 : 11;
+  d.fillRoundRect(box.x,box.y,box.w,box.h,radius,fill);
+  d.drawRoundRect(box.x,box.y,box.w,box.h,radius,border);
+  if(!label || !label[0]) return;
+  d.setFont(large ? ui_fonts::heading.for_text(label) : ui_fonts::body.for_text(label));
   d.setTextDatum(lgfx::textdatum_t::middle_center);
   d.setTextSize(1);
-  d.setTextColor(color);
-  d.drawString(label,x+w/2,y+24);
+  d.setTextColor(enabled ? color : muted,fill);
+  char text[65];
+  snprintf(text,sizeof(text),"%s",label);
+  const int limit=box.w-(box.w<=44 ? 6 : 14);
+  if(d.textWidth(text)>limit) {
+    size_t n=strlen(text);
+    while(n && d.textWidth(text)+d.textWidth("...")>limit) {
+      do { --n; } while(n && (static_cast<uint8_t>(text[n])&0xc0)==0x80);
+      text[n]=0;
+    }
+    strncat(text,"...",sizeof(text)-strlen(text)-1);
+  }
+  d.drawString(text,box.x+box.w/2,box.y+box.h/2);
 }
+
+void draw_usage() {
+  auto& d=M5.Display;
+  const bool current=endurance.active && power_source==PowerSource::Battery;
+  const Activity& a=current ? endurance.live : endurance.last;
+  d.startWrite();
+  d.fillScreen(bg);
+  d.setFont(ui_fonts::heading.get());
+  line(65,"電池の使用状況",1,0x86ff);
+  d.setFont(ui_fonts::body.get());
+  char dur[18], row[64];
+  format_duration(dur,sizeof(dur),current ? battery_run_seconds(elapsed_ms()) : endurance.last_seconds);
+  if (current || endurance.last_valid)
+    snprintf(row,sizeof(row),"%s %s",current ? "今回" : "前回",dur);
+  else snprintf(row,sizeof(row),"計測記録なし");
+  line(101,row,1,fg);
+  if (!a.sample_seen) {
+    line(208,"使用時間の内訳はまだありません",1,muted);
+  } else {
+    const char* names[]={"画面点灯","BLE受信","Wi-Fi","音の回路","画面消灯・待機","緑LED"};
+    const uint32_t times[]={a.screen,a.ble,a.wifi,a.speaker,a.idle,a.led};
+    for (int i=0;i<6;++i) {
+      const int y=140+30*i;
+      d.setTextDatum(lgfx::textdatum_t::middle_left);
+      d.setTextColor(fg,bg);
+      d.drawString(names[i],115,y);
+      format_duration(dur,sizeof(dur),times[i]/1000);
+      d.setTextDatum(lgfx::textdatum_t::middle_right);
+      d.drawString(dur,353,y);
+    }
+  }
+  line(321,"使用時間（重複あり）",1,muted);
+  line(348,"消費電力は未計測",1,muted);
+  line(384,"黄：戻る",1,0xffc8);
+  d.setFont(&lgfx::fonts::Font0);
+  d.endWrite();
+}
+void draw_weather() {
+  auto& d=M5.Display;
+  const auto r=local_weather::read();
+  d.startWrite();
+  d.fillScreen(bg);
+  d.setFont(ui_fonts::heading.get());
+  line(83,"現在の天気",1,0x86ff);
+  if (r.label[0]) {
+    d.setFont(ui_fonts::heading.for_text(r.label));
+    line(129,r.label,1,fg);
+  }
+  if (r.status==local_weather::Result::Ready) {
+    char temp[24], asof[32];
+    snprintf(temp,sizeof(temp),"%.1f℃",r.temperature_tenths/10.0);
+    snprintf(asof,sizeof(asof),"%s JST",r.time_jst);
+    d.setFont(ui_fonts::clock.get());
+    line(202,temp,1,fg);
+    d.setFont(ui_fonts::heading.get());
+    line(259,local_weather::label_for(r.code),1,fg);
+    d.setFont(ui_fonts::body.get());
+    line(300,asof,1,muted);
+    line(323,"Open-Meteo / 推定値",1,muted);
+  } else {
+    const char* status=!have_wifi() ? "Wi-Fi未設定" :
+      r.status==local_weather::Result::Busy ? "時刻・天気を取得中" :
+      r.status==local_weather::Result::NoNetwork ? "Wi-Fiに接続できません" :
+      r.status==local_weather::Result::NoTime ? "時刻を取得できません" :
+      r.status==local_weather::Result::NoForecast ? "天気を取得できません" : "天気データなし";
+    line(220,status,1,fg);
+  }
+  d.setFont(ui_fonts::body.get());
+  draw_button(weather_wifi_btn,"Wi-Fi設定",0x86ff,true,true);
+  d.setFont(ui_fonts::body.get());
+  line(414,"黄：戻る",1,0xffc8);
+  d.setFont(&lgfx::fonts::Font0);
+  d.endWrite();
+  weather_drawn=r.status;
+}
+
+#include "wifi_menu.h"
 
 void draw_alarm() {
   auto& d=M5.Display;
   d.fillScreen(bg);
-  d.setFont(&lgfx::fonts::lgfxJapanGothicP_24);
+  d.setFont(ui_fonts::heading.get());
   line(61, alarm_ringing ? (alarm_preview ? "アラーム試聴" : "アラーム") : "毎日のアラーム", 1, 0xffc8);
   if (alarm_ringing) {
-    d.setFont(&lgfx::fonts::FreeSansBold24pt7b);
+    d.setFont(ui_fonts::large.get());
     if (read_clock()) {
       char hhmm[6];
       snprintf(hhmm,sizeof(hhmm),"%.5s",clock_label+11);
-      line(217,hhmm,2);
-    } else line(217,"ALARM",2);
-    d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-    line(320,"画面・黄・青：停止",1,0xffc8);
+      line(217,hhmm,1);
+    } else line(217,"ALARM",1);
+    d.setFont(ui_fonts::body.get());
+    draw_button(alarm_stop_btn,"停止",0xffc8,true,true);
+    line(375,"黄・青でも停止",1,muted);
     return;
   }
   const bool valid=read_clock();
-  d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
+  d.setFont(ui_fonts::body.get());
   line(105, valid ? "日本時間・毎日・音量 MAX" : "時計未設定のため鳴りません",1,valid ? muted : 0xfaaa);
   char tm[8];
   snprintf(tm,sizeof(tm),"%02d:%02d",alarm_edit_minutes/60,alarm_edit_minutes%60);
-  d.setFont(&lgfx::fonts::FreeSansBold24pt7b);
+  d.setFont(ui_fonts::clock.get());
   line(161,tm,1,fg);
-  alarm_tile(65,197,76,"時 −",fg);
-  alarm_tile(148,197,76,"時 ＋",fg);
-  alarm_tile(244,197,76,"分 −",fg);
-  alarm_tile(327,197,76,"分 ＋",fg);
-  alarm_tile(81,269,188,alarm_edit_on ? "ON  有効" : "OFF  無効",alarm_edit_on ? 0xaff5 : muted);
-  alarm_tile(281,269,107,"試聴",0x86ff);
-  d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
+  draw_button(alarm_hours_minus_btn,"時 −",fg);
+  draw_button(alarm_hours_plus_btn,"時 ＋",fg);
+  draw_button(alarm_minutes_minus_btn,"分 −",fg);
+  draw_button(alarm_minutes_plus_btn,"分 ＋",fg);
+  draw_button(alarm_on_btn,alarm_edit_on ? "ON  有効" : "OFF  無効",alarm_edit_on ? 0xaff5 : muted);
+  draw_button(alarm_preview_btn,"試聴",0x86ff);
+  d.setFont(ui_fonts::body.get());
   line(351,"黄：戻る　青：保存",1,fg);
   line(373,"青 長押し：試聴",1,0x86ff);
   if (alarm_save_error) line(394,"保存できませんでした",1,0xfaaa);
@@ -703,28 +1165,25 @@ bool alarm_click(uint32_t now) {
   // Use the first contact, not the library's click classification on release.
   if (!t.wasPressed()) return false;
   Serial.printf("PICS alarm touch x=%d y=%d\n",int(t.x),int(t.y));
+  const int x=t.x,y=t.y;
   if (alarm_ringing) {
+    if (!alarm_stop_btn.hit(x,y)) return false;
     end_alarm(now);
     return true;
   }
-  if (t.y>=197 && t.y<245) {
-    if (t.x>=65 && t.x<141) alarm_edit_minutes=daily_alarm::set_hour(alarm_edit_minutes,-1);
-    else if (t.x>=148 && t.x<224) alarm_edit_minutes=daily_alarm::set_hour(alarm_edit_minutes,1);
-    else if (t.x>=244 && t.x<320) alarm_edit_minutes=daily_alarm::set_minute(alarm_edit_minutes,-1);
-    else if (t.x>=327 && t.x<403) alarm_edit_minutes=daily_alarm::set_minute(alarm_edit_minutes,1);
-    else return false;
-    return true;
-  }
-  // Include near-edge touches on the round panel, below the button graphics.
-  if (t.y>=255 && t.y<363) {
-    if (t.x>=72 && t.x<269) { alarm_edit_on=!alarm_edit_on; return true; }
-    if (t.x>=273 && t.x<409) { begin_alarm(now,true); return true; }
-  }
-  return false;
+  if (alarm_hours_minus_btn.hit(x,y)) alarm_edit_minutes=daily_alarm::set_hour(alarm_edit_minutes,-1);
+  else if (alarm_hours_plus_btn.hit(x,y)) alarm_edit_minutes=daily_alarm::set_hour(alarm_edit_minutes,1);
+  else if (alarm_minutes_minus_btn.hit(x,y)) alarm_edit_minutes=daily_alarm::set_minute(alarm_edit_minutes,-1);
+  else if (alarm_minutes_plus_btn.hit(x,y)) alarm_edit_minutes=daily_alarm::set_minute(alarm_edit_minutes,1);
+  else if (alarm_on_btn.hit(x,y)) alarm_edit_on=!alarm_edit_on;
+  else if (alarm_preview_btn.hit(x,y)) begin_alarm(now,true);
+  else return false;
+  return true;
 }
 
-constexpr int mascot_band_y = 94;
-constexpr int mascot_base_y = 96;
+constexpr int mascot_band_y = 133;
+constexpr int home_mascot_shift = 32;
+constexpr int mascot_base_y = 135;
 constexpr int mascot_band_w = 300;
 constexpr uint32_t mascot_frame_ms=33;
 uint32_t mascot_at=0;
@@ -775,6 +1234,7 @@ void draw_dog(int x, int y, bool right, uint32_t walk_ms, bool mocha) {
 
 void draw_mascots(bool full) {
   auto& d=M5.Display;
+  const int dy=home_mascot_shift;
   const int left=(d.width()-mascot_band_w)/2;
   constexpr uint32_t cycle_ms=4600;
   constexpr float turn_span=0.035f;
@@ -791,63 +1251,351 @@ void draw_mascots(bool full) {
     if (!full && mascot_prev_x[i]>=0) {
       const int x0=std::min(x,mascot_prev_x[i])-1;
       const int x1=std::max(x,mascot_prev_x[i])+39;
-      d.fillRect(x0,mascot_band_y,x1-x0,32,bg);
+      d.fillRect(x0,mascot_band_y+dy,x1-x0,32,bg);
     }
-    draw_dog(x,mascot_base_y,turn<cycle_ms/2,phase_time,i==1);
+    draw_dog(x,mascot_base_y+dy,turn<cycle_ms/2,phase_time,i==1);
     mascot_prev_x[i]=x;
   }
 }
 
+void smooth_line(int y,const char* value,uint16_t fore,uint16_t back) {
+  auto& d=M5.Display;
+  d.setTextDatum(lgfx::textdatum_t::middle_center);
+  d.setTextColor(fore,back);
+  d.setTextSize(1);
+  d.drawString(value,d.width()/2,y);
+}
+
+void draw_swipe_handle() {
+  // Eight-by-eight subpixel coverage for the lower arc, with round caps.
+  static constexpr uint8_t mask[][79]={
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,1,43,56,49,38,29,20,11,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,11,20,29,38,49,56,43,1,0,0},
+    {0,0,17,64,64,64,64,64,64,64,64,58,50,43,35,29,22,16,8,3,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,3,8,16,22,29,35,43,50,58,64,64,64,64,64,64,64,64,17,0,0},
+    {0,0,8,61,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,62,56,51,48,40,40,32,32,25,24,24,16,16,16,16,11,8,8,8,8,8,8,8,11,16,16,16,16,24,24,25,32,32,40,40,48,51,56,62,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,61,8,0,0},
+    {0,0,0,10,28,37,46,57,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,57,46,37,28,10,0,0,0},
+    {0,0,0,0,0,0,0,0,1,10,18,26,34,42,49,56,63,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,63,56,49,42,34,26,18,10,1,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,5,11,16,24,28,32,38,40,48,48,55,56,58,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,58,56,55,48,48,40,38,32,28,24,16,11,5,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,6,8,8,8,8,8,8,8,8,8,8,8,6,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+  };
+  auto& d=M5.Display;
+  const int x0=d.width()/2-39, y0=d.height()-17;
+  for (unsigned y=0;y<sizeof(mask)/sizeof(mask[0]);++y) {
+    for (unsigned x=0;x<sizeof(mask[0]);++x) {
+      const unsigned a=mask[y][x];
+      if (!a) continue;
+      const unsigned z=64-a;
+      const unsigned r=(31*a+((bg>>11)&31)*z+32)>>6;
+      const unsigned g=(63*a+((bg>>5)&63)*z+32)>>6;
+      const unsigned b=(31*a+(bg&31)*z+32)>>6;
+      d.drawPixel(x0+x,y0+y,uint16_t((r<<11)|(g<<5)|b));
+    }
+  }
+}
+enum class TrialButton : uint8_t { Ready=1, Usb, Detecting, Radio, Done, Hardware };
+TrialButton display_trial_state() {
+  if (oled_rail_trial::tested) return TrialButton::Done;
+  if (power_source==PowerSource::External) return TrialButton::Usb;
+  if (power_source!=PowerSource::Battery) return TrialButton::Detecting;
+  if (receiving || wifi_busy() || local_weather::scanning()) return TrialButton::Radio;
+  return TrialButton::Ready;
+}
+uint8_t oled_visible_error=0;
+bool run_display_trial(uint32_t now,const char* trigger) {
+  auto status=display_trial_state();
+  if(status==TrialButton::Done) return false;
+  oled_visible_error=0;
+  oled_rail_trial::probe={};
+  oled_rail_trial::probe.attempt=++oled_attempts;
+  oled_rail_trial::probe.button=static_cast<uint8_t>(status);
+  Serial.printf("PICS OLED trigger=%s\n",trigger);
+  if (status==TrialButton::Ready) {
+    const auto source=classify_vin(read_vin_mv());
+    if(source==PowerSource::Battery) {
+      if(oled_rail_trial::cut()) {
+        help_view=false;
+        screen_awake=false;
+      } else {
+        status=TrialButton::Hardware;
+        oled_rail_trial::probe.button=static_cast<uint8_t>(status);
+        oled_visible_error=oled_rail_trial::probe.error;
+        if(oled_rail_trial::inactive()) {
+          screen_awake=false;
+          wake_screen();
+        }
+      }
+    } else status=source==PowerSource::External ? TrialButton::Usb : TrialButton::Detecting;
+  }
+  oled_rail_trial::probe.button=static_cast<uint8_t>(status);
+  save_oled_probe();
+  screen_activity_at=now;
+  return screen_awake;
+}
+void sleep_screen_for_idle() {
+  first_tap=false;
+  const bool may_cut=!oled_auto_blocked &&
+      power_source!=PowerSource::Unknown &&
+      !receiving && !scan_in_flight && !wifi_busy() && !local_weather::scanning() &&
+      !alarm_ringing && !alarm_setting_open &&
+      classify_vin(read_vin_mv())==power_source;
+  if (may_cut) {
+    // Keep only the latest cycle, in one compact NVS entry separate from the manual trial.
+    oled_rail_trial::probe={};
+    oled_auto_sequence=oled_auto_record::next(oled_auto_sequence);
+    oled_auto_usb=power_source==PowerSource::External;
+    oled_auto_active=true;
+    if(oled_rail_trial::cut(false)) {
+      screen_awake=false;
+      Serial.printf("PICS OLED auto rail off ms=%lu\n",(unsigned long)oled_rail_trial::probe.rail_ms);
+      save_oled_auto();
+      return;
+    }
+    oled_auto_blocked=true;
+    Serial.printf("PICS OLED auto fallback error=%u\n",unsigned(oled_rail_trial::probe.error));
+    save_oled_auto();
+    if(oled_rail_trial::inactive() && !wake_screen()) { screen_awake=false; return; }
+    oled_auto_active=false;
+  }
+  M5.Display.fillScreen(0x0000);
+  M5.Display.setBrightness(0);
+  screen_awake=false;
+  Serial.println("PICS auto display off (display circuit powered)");
+}
 void draw_button_help() {
-  auto& d = M5.Display;
-  d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-  line(337, "赤：1回 起動・再起動／2回 電源オフ", 1, 0xfaaa);
-  line(360, "黄：表示・切替／長押し：アラーム", 1, 0xffc8);
-  line(383, "青：短押しでテスト／長押しで受信切替", 1, 0x86ff);
+  auto& d=M5.Display;
+  d.startWrite();
+  d.fillScreen(bg);
+  d.setFont(ui_fonts::heading.get());
+  smooth_line(62,"ボタン操作",fg,bg);
+  const bool battery=power_source==PowerSource::Battery && red_policy_ready;
+  d.setFont(ui_fonts::heading.get());
+  smooth_line(111,"赤",0xfaaa,bg);
+  d.setFont(ui_fonts::body.get());
+  smooth_line(139,battery ? "長押し：電源オフ" : "1回：起動・再起動",fg,bg);
+  smooth_line(164,battery ? "3回：再起動（計測を保存）" : "2回：電源オフ",fg,bg);
+  d.setFont(ui_fonts::heading.get());
+  smooth_line(202,"黄",0xffc8,bg);
+  d.setFont(ui_fonts::body.get());
+  smooth_line(229,"短押し：表示・写真から戻る・CH切替",fg,bg);
+  smooth_line(254,"長押し：アラーム設定",fg,bg);
+  d.setFont(ui_fonts::heading.get());
+  smooth_line(293,"青",0x86ff,bg);
+  d.setFont(ui_fonts::body.get());
+  smooth_line(320,"短押し：テスト",fg,bg);
+  smooth_line(345,"長押し：受信を開始・停止",fg,bg);
+  const auto trial=display_trial_state();
+  const char* trial_label=trial==TrialButton::Done ? "表示電源オフ：試験済み" :
+      trial==TrialButton::Usb ? "試すにはUSBを抜く" :
+      trial==TrialButton::Detecting ? "電池駆動を確認中" :
+      trial==TrialButton::Radio ? "通信が終わるまで待機" : "表示電源オフを試す（青）";
+  char failed[40];
+  if(oled_visible_error) {
+    snprintf(failed,sizeof(failed),"表示電源オフ失敗 E%u",unsigned(oled_visible_error));
+    draw_button(display_trial_btn,failed,0xfaaa,!oled_rail_trial::tested);
+  } else draw_button(display_trial_btn,trial_label,0xaff5,trial==TrialButton::Ready);
+  d.setFont(ui_fonts::body.get());
+  smooth_line(426,"下スワイプ／黄で閉じる",muted,bg);
   d.setFont(&lgfx::fonts::Font0);
+  draw_swipe_handle();
+  d.endWrite();
+}
+
+constexpr int home_date_y=49, home_clock_y=91, home_weather_y=141;
+constexpr int home_top_divide_y=117, home_weather_end_y=161;
+constexpr int home_logo_y=166, home_brand_y=239;
+constexpr int home_battery_y=home_usage_btn.y+19, home_previous_y=home_usage_btn.y+50;
+constexpr int home_idle_status_y=291, home_rx_status_y=281, home_rx_info_y=319;
+// Shared focus layout for live PICS and the isolated demo.
+constexpr int signal_logo_y=100, signal_brand_y=176, signal_heading_y=221;
+constexpr int signal_state_y=267, signal_number_y=328;
+constexpr int signal_clear_y=199, signal_clear_end=369, signal_clear_w=250;
+constexpr int signal_rx_y=388, signal_rx_w=216;
+void draw_weather_icon(int x,int y,int code,bool fresh) {
+  auto& d=M5.Display;
+  const bool ready=code>=0;
+  const uint16_t sun=fresh ? 0xff46 : muted;
+  const uint16_t cloud=fresh ? 0xb6bc : muted;
+  const uint16_t rain=fresh ? 0x661f : muted;
+  if (code==0 || code==1 || code==2) {
+    const int sx=code==0 ? x : x-4;
+    const int sy=code==0 ? y : y-3;
+    d.fillCircle(sx,sy,6,sun);
+    constexpr int8_t rays[8][4]={
+      {0,-9,0,-12},{0,9,0,12},{-9,0,-12,0},{9,0,12,0},
+      {-6,-6,-9,-9},{6,-6,9,-9},{-6,6,-9,9},{6,6,9,9}};
+    for (const auto& r:rays) d.drawLine(sx+r[0],sy+r[1],sx+r[2],sy+r[3],sun);
+  }
+  if (code!=0) {
+    const int cy=(code==1 || code==2) ? y+3 : y-1;
+    if (ready) {
+      d.fillCircle(x-6,cy,5,cloud);
+      d.fillCircle(x+2,cy-4,7,cloud);
+      d.fillCircle(x+9,cy,5,cloud);
+      d.fillRoundRect(x-11,cy,25,6,3,cloud);
+    } else {
+      d.drawRoundRect(x-8,cy-2,17,7,3,cloud);
+      d.drawCircle(x+1,cy-3,4,cloud);
+    }
+    if ((code>=51 && code<=67) || (code>=80 && code<=82))
+      for (int i=-5;i<=5;i+=5) d.drawLine(x+i,cy+6,x+i-2,cy+9,rain);
+    else if ((code>=71 && code<=77) || code==85 || code==86)
+      for (int i=-5;i<=5;i+=5) d.fillCircle(x+i,cy+8,1,cloud);
+    else if (code==45 || code==48)
+      for (int k=0;k<2;++k) d.drawFastHLine(x-6+k*2,cy+6+3*k,13-k*3,cloud);
+    else if (code>=95)
+      d.fillTriangle(x+1,cy+3,x-4,cy+11,x+5,cy+5,sun);
+  }
+}
+
+void draw_weather_row(int cx,int y) {
+  auto& d=M5.Display;
+  const auto& w=last_home_weather;
+  const bool ready=w.status==local_weather::Result::Ready;
+  const time_t utc=ready ? time(nullptr) : 0;
+  const bool fresh=ready && utc>=w.epoch && utc-w.epoch<=90*60;
+  const bool next=ready && local_weather::forecast_is_tomorrow(w,utc);
+  const bool next_fresh=next && utc>=w.epoch && utc-w.epoch<=6*3600;
+  char temp[20], other[24];
+  if (ready) snprintf(temp,sizeof(temp),"%.1f℃",w.temperature_tenths/10.0);
+  else snprintf(temp,sizeof(temp),"--℃");
+  if (next) {
+    const long lo=std::lround(w.next_min_tenths/10.0);
+    const long hi=std::lround(w.next_max_tenths/10.0);
+    snprintf(other,sizeof(other),"%ld〜%ld℃",lo,hi);
+  } else snprintf(other,sizeof(other),"--℃");
+  constexpr int icon_w=31;
+  const bool enabled=!receiving;
+  const uint16_t tile_bg=enabled ? panel : 0x10e6;
+  draw_button(home_weather_btn,nullptr,fg,enabled);
+  d.setTextDatum(lgfx::textdatum_t::middle_left);
+  d.setTextSize(1);
+  d.setFont(ui_fonts::heading.get());
+  const int today_left=cx-94-(icon_w+7+d.textWidth(temp))/2;
+  draw_weather_icon(today_left+icon_w/2,y,ready ? w.code : -1,fresh);
+  d.setTextColor(fresh ? fg : muted,tile_bg);
+  d.drawString(temp,today_left+icon_w+7,y);
+
+  d.drawFastVLine(cx,y-12,24,0x296c);
+  d.setFont(ui_fonts::body.get());
+  const int label_w=d.textWidth("明日");
+  const int next_left=cx+96-(label_w+icon_w+8+d.textWidth(other))/2;
+  d.setTextColor(muted,tile_bg);
+  d.drawString("明日",next_left,y);
+  draw_weather_icon(next_left+label_w+4+icon_w/2,y,next ? w.next_code : -1,next_fresh);
+  d.setTextColor(next_fresh ? fg : muted,tile_bg);
+  d.drawString(other,next_left+label_w+icon_w+8,y);
+}
+// Native emoji-style icon: no emoji font needed, and the fill follows the charge.
+constexpr int battery_icon_w=25, battery_icon_gap=7;
+constexpr int battery_icon_fill(int percent) {
+  return percent<=0 ? 0 : (16 * std::min(percent,100) + 99) / 100;
+}
+static_assert(battery_icon_fill(-1)==0 && battery_icon_fill(0)==0 &&
+              battery_icon_fill(50)==8 && battery_icon_fill(100)==16);
+
+void draw_battery_icon(int x,int y,int percent,uint16_t back) {
+  auto& d=M5.Display;
+  const uint16_t outline=percent<0 ? muted : 0xd6fb;
+  d.fillSmoothRoundRect(x+21,y-3,4,6,1,outline);
+  d.fillSmoothRoundRect(x,y-7,22,14,3,outline);
+  d.fillSmoothRoundRect(x+2,y-5,18,10,2,back);
+  const int charge=battery_icon_fill(percent);
+  const uint16_t color=percent<=15 ? 0xfaaa : percent<=30 ? 0xff06 : 0x6f93;
+  if (charge>=3) d.fillSmoothRoundRect(x+3,y-4,charge,8,2,color);
+  else if (charge>0) d.fillRect(x+3,y-3,charge,6,color);
 }
 
 void draw_power_banner() {
   auto& d = M5.Display;
   const int cx=d.width()/2;
-  d.fillRect(cx-102,20,204,68,bg);
-  d.fillRect(cx-102,396,204,45,bg);
+  const bool badge=have_wifi();
+  const int divide_y=home_top_divide_y;
+  const int weather_end=home_weather_end_y;
+  const int date_y=home_date_y;
+  d.fillRect(cx-125,18,250,divide_y-18,bg);
+  d.fillRect(cx-188,divide_y,376,weather_end-divide_y,bg);
+  const bool usage_enabled=endurance_can_save && !receiving;
+  const uint16_t battery_bg=usage_enabled ? panel : 0x1127;
+  if (usage_enabled) draw_button(home_usage_btn,nullptr);
+  else d.fillRoundRect(home_usage_btn.x,home_usage_btn.y,home_usage_btn.w,home_usage_btn.h,11,battery_bg);
   const bool clock_valid=strlen(clock_label)==19 && clock_label[4]=='/' && clock_label[10]==' ';
   char date[24];
   if (clock_valid) snprintf(date,sizeof(date),"%.10s",clock_label);
   else snprintf(date,sizeof(date),"日時未設定");
-  d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
+  d.setFont(ui_fonts::body.get());
   char battery[18], time_text[18], row[64];
   if (battery_percent < 0) snprintf(battery, sizeof(battery), "--%%");
   else snprintf(battery, sizeof(battery), "%d%%", battery_percent);
   if (endurance.active) {
     format_duration(time_text, sizeof(time_text), battery_run_seconds(elapsed_ms()));
-    snprintf(row, sizeof(row), "電池 %s  計測 %s", battery, time_text);
+    snprintf(row, sizeof(row), "%s  計測 %s", battery, time_text);
   } else {
-    snprintf(row, sizeof(row), "電池 %s  %s", battery,
+    snprintf(row, sizeof(row), "%s  %s", battery,
              power_source == PowerSource::External ? "USB給電" : "判定中");
   }
-  line(407, row, 1, battery_percent >= 0 && battery_percent <= 15 ? 0xfaaa : 0xaff5);
+  d.setFont(ui_fonts::body.get());
+  d.setTextSize(1);
+  if (endurance.active && d.textWidth(row)+battery_icon_w+battery_icon_gap>210)
+    snprintf(row,sizeof(row),"%s  %s",battery,time_text);
+  const int battery_y=home_battery_y;
+  const int row_left=cx-(d.textWidth(row)+battery_icon_w+battery_icon_gap)/2;
+  draw_battery_icon(row_left,battery_y,battery_percent,battery_bg);
+  d.setTextDatum(lgfx::textdatum_t::middle_left);
+  d.setTextColor(battery_percent >= 0 && battery_percent <= 15 ? 0xfaaa : 0xaff5,battery_bg);
+  d.drawString(row,row_left+battery_icon_w+battery_icon_gap,battery_y);
   if (endurance.last_valid) {
     format_duration(time_text, sizeof(time_text), endurance.last_seconds);
     snprintf(row, sizeof(row), "前回 %s%s", endurance.last_interrupted ? "約 " : "", time_text);
   } else snprintf(row, sizeof(row), "前回 --:--:--");
-  line(429, endurance_can_save ? row : "記録保存なし", 1, muted);
-  d.setFont(&lgfx::fonts::lgfxJapanGothicP_24);
-  line(32, date, 1, muted);
-  d.setFont(&lgfx::fonts::FreeSansBold24pt7b);
-  line(65, clock_valid ? clock_label+11 : "--:--:--", 1, fg);
+  smooth_line(home_previous_y,endurance_can_save ? row : "記録保存なし",muted,battery_bg);
+  if (usage_enabled) smooth_line(home_usage_btn.y+81,"使用状況  >",0x86ff,battery_bg);
+  d.setFont(ui_fonts::heading.get());
+  if (clock_valid && clock_weekday>=0 && clock_weekday<7) {
+    d.setTextSize(1);
+    const int date_w=d.textWidth(date);
+    char day[16];
+    snprintf(day,sizeof(day),"（%s）",weekdays[clock_weekday]);
+    d.setFont(ui_fonts::body.get());
+    const int day_w=d.textWidth(day);
+    const int left=cx-(date_w+day_w+3)/2;
+    d.setTextColor(muted,bg);
+    d.setTextDatum(lgfx::textdatum_t::middle_left);
+    d.setFont(ui_fonts::heading.get());
+    d.drawString(date,left,date_y);
+    d.setFont(ui_fonts::body.get());
+    d.drawString(day,left+date_w+3,date_y+2);
+  } else line(date_y,date,1,muted);
+  d.setFont(ui_fonts::clock.get());
+  smooth_line(home_clock_y,clock_valid ? clock_label+11 : "--:--:--",fg,bg);
+  if (badge) draw_weather_row(cx,home_weather_y);
+  else draw_button(home_weather_btn,"天気・Wi-Fi設定",0x86ff,!receiving);
+  draw_swipe_handle();
   d.setFont(&lgfx::fonts::Font0);
 }
 
-void draw_brand() {
+void draw_brand(bool signal_layout) {
   auto& d=M5.Display;
   const bool swap=d.getSwapBytes();
   d.setSwapBytes(true);
-  d.pushImage(d.width()/2-25,88,50,50,system_kakari_mark);
+  d.pushImage(d.width()/2-25,signal_layout ? signal_logo_y : home_logo_y,50,50,system_kakari_mark);
   d.setSwapBytes(swap);
-  d.setFont(&lgfx::fonts::lgfxJapanGothicP_24);
-  line(149,"システム係",1,fg);
+  d.setFont(ui_fonts::heading.get());
+  line(signal_layout ? signal_brand_y : home_brand_y,"システム係",1,fg);
+  d.setFont(&lgfx::fonts::Font0);
+}
+
+void draw_reception_status(int y, bool focused_view) {
+  auto& d=M5.Display;
+  const int w=focused_view ? signal_rx_w : 300;
+  d.fillRect((d.width()-w)/2,y-13,w,26,bg);
+  const char* label="受信中";
+  d.setFont(ui_fonts::body.for_text(label));
+  line(y,label,1,0x86ff);
   d.setFont(&lgfx::fonts::Font0);
 }
 
@@ -860,66 +1608,67 @@ void draw_focus(const pics::Snapshot& snap, bool blink_on) {
   const bool valid=selectable(sig.state);
   const int level=valid && sig.remaining_stage>=1 && sig.remaining_stage<=8
                  ? sig.remaining_stage : 0;
-  const uint16_t accent=red ? 0xfb97 : valid ? 0x4f99 : muted;
+  constexpr uint16_t signal_red=0xf944; // Vivid red, approximately #FF2821.
+  const uint16_t accent=red ? signal_red : valid ? 0x4f99 : muted;
   const uint16_t dark=0x21ca;
-  constexpr int starts[]={127,156,185,214,303,332,1,30};
-  for (uint8_t i=0; i<8; ++i) {
+  lgfx::rgb565_t on[16], off[16];
+  auto palette=[&](lgfx::rgb565_t* out,uint16_t color) {
+    for (unsigned a=0;a<16;++a) {
+      const unsigned z=15-a;
+      const unsigned r=(((color>>11)&31)*a+((bg>>11)&31)*z+7)/15;
+      const unsigned g=(((color>>5)&63)*a+((bg>>5)&63)*z+7)/15;
+      const unsigned b=((color&31)*a+(bg&31)*z+7)/15;
+      out[a]=uint16_t((r<<11)|(g<<5)|b);
+    }
+  };
+  palette(on,accent);
+  palette(off,dark);
+  for (uint8_t i=0;i<8;++i) {
+    const auto& a=signal_mask::arcs[i];
     const bool lit=i<level && (!blink || blink_on);
-    d.fillArc(d.width()/2,d.height()/2,218,205,starts[i],starts[i]+24,lit?accent:dark);
+    d.pushImage(d.width()/2+a.x,d.height()/2+a.y,a.w,a.h,
+                static_cast<const void*>(a.pixels),0,lgfx::palette_4bit,lit ? on : off);
   }
-  d.fillRect((d.width()-300)/2,161,300,202,bg);
-  d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-  line(170,test_active ? "テスト・模擬データ" : "受信データ・観測用",1,test_active ? 0xfda0 : muted);
-  d.setFont(&lgfx::fonts::lgfxJapanGothic_24);
-  line(189,red ? "赤信号" : blink ? "青点滅" : valid ? "青信号" : "状態不明",1,accent);
+  d.fillRect((d.width()-signal_clear_w)/2,signal_clear_y,signal_clear_w,signal_clear_end-signal_clear_y,bg);
+  d.setFont(ui_fonts::body.get());
+  line(signal_heading_y,test_active ? "テスト・模擬データ" : "受信データ・観測用",1,test_active ? 0xfda0 : muted);
+  d.setFont(ui_fonts::heading.get());
+  line(signal_state_y,red ? "赤信号" : blink ? "青点滅" : valid ? "青信号" : "状態不明",1,accent);
   char number[4];
   if (level) snprintf(number,sizeof(number),"%d",level);
   else snprintf(number,sizeof(number),"-");
-  d.setFont(&lgfx::fonts::FreeSansBold24pt7b);
-  line(239,number,3,fg);
-  d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-  line(293,"残り段階  /  8（秒ではない）",1,muted);
-  char label[40];
-  if (test_active) snprintf(label,sizeof(label),"DEMO / CH %02u",unsigned(selected_channel+1));
-  else snprintf(label,sizeof(label),"%08lX / CH %02u",
-                (unsigned long)r.intersection,unsigned(selected_channel+1));
-  d.setFont(&lgfx::fonts::Font0);
-  line(320,label,2,fg);
-  const int slots=r.count<=6 ? r.count : 6;
-  for(int i=0; i<slots; ++i) {
-    const int x=d.width()/2 + (i*22) - (slots-1)*11;
-    d.fillCircle(x,348, i==selected_channel ? 5 : 4,
-                 i==selected_channel ? accent : selectable(r.signal[i].state) ? muted : dark);
-    if (i==selected_channel) d.drawCircle(x,348,8,fg);
-  }
+  d.setFont(ui_fonts::large.get());
+  line(signal_number_y,number,1,fg);
 }
 
 void draw(const pics::Snapshot& snap, bool blink_on=true) {
   auto& d = M5.Display;
   d.startWrite();
   d.fillScreen(bg);
-  draw_power_banner();
-  draw_mascots(true);
-  draw_brand();
-  if (snap.status == pics::Snapshot::Status::Single) {
+  const bool single=snap.status==pics::Snapshot::Status::Single && snap.report.count>0;
+  if (!test_active && !single) {
+    draw_power_banner();
+    draw_mascots(true);
+  }
+  draw_brand(test_active || single);
+  if (single) {
     draw_focus(snap,blink_on);
-    d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-    line(379,test_active ? "青：テスト終了" : "受信中・黄：CH切替",1,0x86ff);
-    d.setFont(&lgfx::fonts::Font0);
-  } else {
-    if (test_active) {
-      d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-      line(170,"テスト・模擬データ",1,0xfda0);
-      d.setFont(&lgfx::fonts::Font0);
-    }
-    d.setFont(&lgfx::fonts::lgfxJapanGothic_24);
-    line(215,snap.status==pics::Snapshot::Status::Multiple ? "複数の交差点" :
-         (test_active || receiving) ? "受信待ち" : "受信オフ",1,fg);
-    d.setFont(&lgfx::fonts::lgfxJapanGothic_16);
-    line(252,snap.status==pics::Snapshot::Status::Multiple ? "信号の個別表示を停止" :
-         test_active ? "新しいデータはありません" :
-         receiving ? "受信中" : "青の長押しで受信開始",1,muted);
-    draw_button_help();
+    if (receiving && !test_active)
+      draw_reception_status(signal_rx_y,true);
+  } else if (!test_active) {
+    const bool live=receiving;
+    const int cx=d.width()/2;
+    const int status_y=live ? home_rx_status_y : home_idle_status_y;
+    d.fillRoundRect(cx-92,status_y-21,184,43,21,live ? 0x12ad : 0x1107);
+    d.drawRoundRect(cx-92,status_y-21,184,43,21,live ? 0x3457 : 0x294c);
+    d.setFont(ui_fonts::heading.get());
+    smooth_line(status_y,snap.status==pics::Snapshot::Status::Multiple ? "複数の交差点" :
+                live ? "受信待ち" : "受信オフ",live ? 0xdfff : muted,live ? 0x12ad : 0x1107);
+    d.setFont(ui_fonts::body.get());
+    if (receiving)
+      draw_reception_status(home_rx_info_y,false);
+    else if (snap.status==pics::Snapshot::Status::Multiple)
+      line(home_rx_info_y,"信号の個別表示を停止",1,muted);
   }
   d.endWrite();
 }
@@ -941,7 +1690,8 @@ void setup() {
   M5.Display.setBrightness(screen_brightness);
   M5.Display.setFont(&lgfx::fonts::Font0);
   report_display();
-  if (gallery::photo_count) Serial.printf("PICS gallery ready photos=%d touch=%u zoom=4 rounded=1 pan=1\n", gallery::photo_count, unsigned(M5.Touch.isEnabled()));
+  Serial.printf("PICS boot reset=%u radio=%s\n",unsigned(esp_reset_reason()),wifi_radio_state());
+  if (gallery::photo_count) Serial.printf("PICS gallery ready photos=%d touch=%u zoom=8 rounded=1 pan=1\n", gallery::photo_count, unsigned(M5.Touch.isEnabled()));
   panel_ready = M5.Display.getBoard() == lgfx::board_M5StopWatch &&
                 M5.Display.width() > 0 && M5.Display.height() > 0;
   if (panel_ready) {
@@ -949,9 +1699,21 @@ void setup() {
     delay(750);
   }
   if (panel_ready) {
+    ui_fonts::begin();
     load_endurance();
+    load_oled_auto();
+    oled_rail_trial::report_preflight();
+    oled_rail_trial::Probe last;
+    if(endurance_can_save && endurance_store.getBytesLength("oled_detail2")==sizeof(last) &&
+       endurance_store.getBytes("oled_detail2",&last,sizeof(last))==sizeof(last) &&
+       last.tag==oled_rail_trial::probe_tag) {
+      oled_attempts=last.attempt;
+      log_oled_probe(last);
+    }
+    Serial.printf("PICS wifi profiles count=%d\n",wifi_profiles::count(wifi_book));
     load_alarm();
-    if (read_clock()) Serial.printf("PICS clock retained %s JST\n",clock_label);
+    if (read_clock()) Serial.printf("PICS clock retained %s JST weekday=%d\n",clock_label,clock_weekday);
+    if (have_wifi()) start_weather("boot");
     update_battery();
     update_power_source(elapsed_ms());
   }
@@ -963,29 +1725,44 @@ void loop() {
   M5.update();
   const uint32_t now = millis();
   const uint64_t run_ms = elapsed_ms();
+  const auto prior_power_source=power_source;
+  const bool prior_red_ready=red_policy_ready;
   if (panel_ready) {
+    sample_activity(run_ms);
     update_power_source(run_ms);
+    if(power_source!=prior_power_source)
+      Serial.printf("PICS supply %s -> %s radio=%s\n",source_name(prior_power_source),
+                    source_name(power_source),wifi_radio_state());
+    poll_red_button(now,run_ms);
     poll_clock_command();
+    poll_weather();
   }
   static uint32_t diag_at = 0;
   if ((int32_t)(now - diag_at) >= 0) {
     diag_at = now + 5000;
-    Serial.printf("PICS screen=%s scans=%lu rx=%u scan=%u ms=%lu\n",
+    Serial.printf("PICS screen=%s scans=%lu alarm=%02d:%02d/%u vol=%u saved=%u rx=%u scan=%u supply=%s radio=%s\n",
                   screen_awake ? "on" : "off", (unsigned long)scan_cycles,
-                  unsigned(receiving), unsigned(scan_in_flight), (unsigned long)now);
+                  daily_alarm::minutes_of(alarm_setting)/60,daily_alarm::minutes_of(alarm_setting)%60,
+                  unsigned(bool(alarm_setting & daily_alarm::enabled_bit)),unsigned(alarm_volume),
+                  unsigned(endurance_can_save && endurance_store.getUShort("alarm_cfg",0)==alarm_setting),
+                  unsigned(receiving), unsigned(scan_in_flight), source_name(power_source), wifi_radio_state());
+  }
+  const bool alarm_changed = panel_ready && alarm_tick(now);
+  if (alarm_ringing) {
+    weather_view=false; usage_view=false; help_view=false;
+    if(wifi_page!=WifiPage::Closed) wifi_close();
   }
   poll_reception(now);
-  bool force_redraw = panel_ready && alarm_tick(now);
-  bool alarm_ui_dirty = force_redraw;
+  bool force_redraw = alarm_changed ||
+      prior_power_source!=power_source || prior_red_ready!=red_policy_ready;
+  bool alarm_ui_dirty = alarm_changed;
   // A short yellow press keeps the old action. Hold it to open settings.
   if (M5.BtnA.wasPressed()) {
     alarm_ignore_yellow_release = !screen_awake || alarm_ringing;
     if (!screen_awake && panel_ready) {
-      M5.Display.setBrightness(screen_brightness);
-      screen_awake = true;
-      force_redraw = true;
+      force_redraw = wake_screen();
       screen_activity_at = now;
-      Serial.printf("PICS yellow wake scans=%lu ms=%lu\n",
+      Serial.printf("PICS yellow wake ok=%u scans=%lu ms=%lu\n",unsigned(screen_awake),
                     (unsigned long)scan_cycles, (unsigned long)now);
     }
   }
@@ -993,12 +1770,16 @@ void loop() {
       M5.BtnA.pressedFor(alarm_hold_ms)) {
     // The menu state prevents repeated opening while the button is held.
     alarm_ignore_yellow_release = true;
+    if(wifi_page!=WifiPage::Closed) wifi_close();
     alarm_setting_open = true;
     alarm_ignore_blue_release = false;
     alarm_edit_minutes = daily_alarm::minutes_of(alarm_setting);
     alarm_edit_on = bool(alarm_setting & daily_alarm::enabled_bit);
     alarm_save_error = false;
     if (test_active) end_test();
+    weather_view=false;
+    usage_view=false;
+    help_view=false;
     photo_page = 0;
     reset_gallery_gesture();
     alarm_ui_dirty = true;
@@ -1039,7 +1820,7 @@ void loop() {
       }
     }
     if (alarm_setting_open || alarm_ringing) {
-      if (alarm_ui_dirty) draw_alarm();
+      if (screen_awake && alarm_ui_dirty) draw_alarm();
       if (M5.BtnA.wasReleased()) alarm_ignore_yellow_release = false;
       delay(5);
       return;
@@ -1047,9 +1828,84 @@ void loop() {
     screen_activity_at = now;
     force_redraw = true;
   }
-  if (gallery::photo_count && panel_ready && M5.Touch.isEnabled()) {
+  if (panel_ready && screen_awake && weather_view && M5.Touch.isEnabled() && M5.Touch.getCount()==1) {
+    const auto& t=M5.Touch.getDetail();
+    if(t.wasPressed()) {
+      screen_activity_at=now;
+      if(wifi_page!=WifiPage::Closed) wifi_tap(int(t.x),int(t.y));
+      else if(weather_wifi_btn.hit(int(t.x),int(t.y))) {
+        wifi_go(WifiPage::List);
+      }
+    }
+  }
+  if (wifi_page!=WifiPage::Closed) {
+    if (!screen_awake || uint32_t(now-screen_activity_at)>=screen_timeout_ms) {
+      wifi_close(); weather_view=false; force_redraw=true;
+    } else {
+      if (M5.BtnA.wasReleased()) {
+        if (!alarm_ignore_yellow_release && !swallow_yellow) wifi_back();
+        alarm_ignore_yellow_release=false;
+        screen_activity_at=now;
+      }
+      if(wifi_page!=WifiPage::Closed) {
+        if(wifi_deferred_scan && !wifi_busy()) {
+          wifi_deferred_scan=false;
+          local_weather::scan_start();
+          wifi_ui_dirty=true;
+        }
+        if(wifi_ui_dirty || wifi_drawn_scan!=local_weather::scan_state() ||
+           wifi_drawn_busy!=wifi_busy()) draw_wifi_menu();
+        mascot_previous_ms=0;
+        delay(5); return;
+      }
+      force_redraw=true;
+      swallow_yellow=true;
+    }
+  }
+  static bool trial_press_handled=false;
+  if (!screen_awake || !help_view) trial_press_handled=false;
+  if (panel_ready && M5.Touch.isEnabled() && !test_active && !weather_view && !usage_view) {
     const auto g = gallery_gesture(now);
-    if (screen_awake && !test_active && photo_page && photo_scale > 1 && (g.dx || g.dy || g.drag_end)) {
+    if (screen_awake && help_view) {
+      bool trial_tap=g.tap && display_trial_btn.hit(g.x,g.y);
+      if(M5.Touch.getCount()==1) {
+        const auto& t=M5.Touch.getDetail();
+        // Use the same first-contact event as Wi-Fi settings, with tap-release as a fallback.
+        if(t.wasPressed()) {
+          trial_press_handled=display_trial_btn.hit(int(t.x),int(t.y));
+          trial_tap=trial_press_handled;
+        } else if(t.wasReleased()) {
+          trial_tap=trial_tap && !trial_press_handled;
+          trial_press_handled=false;
+        }
+      } else trial_press_handled=false;
+      if (g.drawer<0) {
+        help_view=false;
+        screen_activity_at=now;
+        force_redraw=true;
+        Serial.println("PICS button help closed by swipe");
+      } else if (trial_tap) {
+        force_redraw=run_display_trial(now,"touch") || force_redraw;
+      }
+    } else if (screen_awake && !photo_page && g.drawer>0) {
+      oled_visible_error=0;
+      help_view=true;
+      screen_activity_at=now;
+      force_redraw=true;
+      Serial.println("PICS button help opened by swipe");
+    } else if (screen_awake && !test_active && !receiving && !photo_page && g.tap &&
+        endurance_can_save && home_usage_btn.hit(g.x,g.y)) {
+      usage_view=true;
+      Serial.println("PICS usage screen");
+      screen_activity_at=now;
+      force_redraw=true;
+    } else if (screen_awake && !test_active && !receiving && !photo_page && g.tap &&
+        home_weather_btn.hit(g.x,g.y)) {
+      weather_view=true;
+      screen_activity_at=now;
+      start_weather("weather-tap");
+      force_redraw=true;
+    } else if (screen_awake && !test_active && photo_page && photo_scale > 1 && (g.dx || g.dy || g.drag_end)) {
       screen_activity_at = now;
       first_tap = false;
       if (g.dx || g.dy) pan_pending = move_zoom_view(g.dx, g.dy) || pan_pending;
@@ -1057,7 +1913,7 @@ void loop() {
         Serial.printf("PICS gallery pan page=%d zoom=%d x=%d y=%d cached=%u\n",
                       photo_page, photo_scale, photo_view_x, photo_view_y, unsigned(cached_success));
       }
-    } else if (screen_awake && !test_active && g.direction) {
+    } else if (gallery::photo_count && screen_awake && !test_active && g.direction) {
       reset_gallery_gesture();
       photo_page = gallery::next_page(photo_page, g.direction, gallery::photo_count);
       screen_activity_at = now;
@@ -1073,7 +1929,12 @@ void loop() {
     alarm_ignore_yellow_release = false;
     if (!ignore) {
       screen_activity_at = now;
-      if (screen_awake && photo_page) {
+      if (screen_awake && (weather_view || usage_view || help_view)) {
+        weather_view=false;
+        usage_view=false;
+        help_view=false;
+        force_redraw=true;
+      } else if (screen_awake && photo_page) {
         photo_page = 0;
         reset_gallery_gesture();
         force_redraw = true;
@@ -1085,21 +1946,26 @@ void loop() {
     if (M5.BtnB.wasPressed()) live_blue_held = false;
     const bool blue_long = !live_blue_held && M5.BtnB.pressedFor(700);
     const bool blue_short = !live_blue_held && M5.BtnB.wasReleased();
-    if (blue_long || blue_short) {
+    if (blue_short && help_view && screen_awake) {
+      force_redraw=run_display_trial(now,"blue") || force_redraw;
+    } else if (blue_long || blue_short) {
       live_blue_held = blue_long;
+      weather_view=false;
+      usage_view=false;
+      help_view=false;
       photo_page = 0;
       reset_gallery_gesture();
       screen_activity_at=now;
       if (!screen_awake) {
-        M5.Display.setBrightness(screen_brightness);
-        screen_awake=true;
+        if (!wake_screen()) { delay(5); return; }
       }
       if (blue_long) {
         if (test_active) end_test();
         if (receiving) end_reception("button");
         else begin_reception(now);
-      } else if (test_active) end_test();
-      else {
+      } else if (test_active) {
+        end_test();
+      } else {
         test_receiver.reset();
         test_active=true;
         test_started_at=now;
@@ -1109,22 +1975,46 @@ void loop() {
       force_redraw=true;
     }
   }
+  const bool was_testing=test_active;
   update_test(now);
+  if (was_testing && !test_active) {
+    screen_activity_at=now;
+    force_redraw=true;
+  }
   if (panel_ready && screen_awake && !test_active && !receiving &&
       uint32_t(now - screen_activity_at) >= screen_timeout_ms) {
-    // Show black before dimming the AMOLED. Keep the panel controller
-    // awake so the next button press need not exit hardware sleep.
-    first_tap = false;
-    M5.Display.fillScreen(0x0000);
-    M5.Display.setBrightness(0);
-    screen_awake = false;
-    Serial.printf("PICS auto display off scans=%lu ms=%lu\n",
-                  (unsigned long)scan_cycles, (unsigned long)now);
+    sleep_screen_for_idle();
   }
   bool banner_dirty=false;
   if (panel_ready && screen_awake &&
       (force_redraw || uint32_t(millis() - battery_sample_at) >= 10000))
     banner_dirty=update_battery();
+  if (help_view) {
+    static auto previous_trial=TrialButton::Detecting;
+    const auto trial=display_trial_state();
+    if (screen_awake && (force_redraw || trial!=previous_trial)) draw_button_help();
+    previous_trial=trial;
+    mascot_previous_ms=0;
+    delay(5);
+    return;
+  }
+  if (usage_view) {
+    static uint64_t usage_draw_second=UINT64_MAX;
+    if (screen_awake && (force_redraw || usage_draw_second!=run_ms/1000)) {
+      usage_draw_second=run_ms/1000;
+      draw_usage();
+    }
+    mascot_previous_ms=0;
+    delay(5);
+    return;
+  }
+  if (weather_view) {
+    if (screen_awake && (force_redraw || weather_drawn!=local_weather::read().status))
+      draw_weather();
+    mascot_previous_ms=0;
+    delay(5);
+    return;
+  }
   if (photo_page) {
     // Skip the normal screen's painters, but keep scanning and accounting.
     if (screen_awake && force_redraw) {
@@ -1198,20 +2088,20 @@ void loop() {
     shown_count=single?s.report.count:0;shown_usable=usable;
   }
   static uint64_t banner_second = UINT64_MAX;
-  if (panel_ready && screen_awake && (force_redraw || banner_dirty || banner_second != run_ms / 1000)) {
+  if (panel_ready && screen_awake && !test_active && !focused && (force_redraw || banner_dirty || banner_second != run_ms / 1000)) {
     banner_second = run_ms / 1000;
     read_clock();
     M5.Display.startWrite();
     draw_power_banner();
     M5.Display.endWrite();
   }
-  if (panel_ready && screen_awake) {
+  if (panel_ready && screen_awake && !test_active && !focused) {
     const uint32_t frame_now=millis();
     if (uint32_t(frame_now-mascot_at)>=mascot_frame_ms) {
       const uint32_t gap=mascot_previous_ms?frame_now-mascot_previous_ms:mascot_frame_ms;
       mascot_at=frame_now;
       mascot_previous_ms=frame_now;
-      mascot_walk_ms+=gap*(test_active?5:4)/4;
+      mascot_walk_ms+=gap;
       M5.Display.startWrite();
       draw_mascots(false);
       M5.Display.endWrite();
@@ -1221,8 +2111,8 @@ void loop() {
       mascot_stats_max=std::max(mascot_stats_max,gap);
       if (uint32_t(frame_now-mascot_stats_at)>=5000 && mascot_stats_frames>=5) {
         if (Serial.availableForWrite()>=104)
-          Serial.printf("PICS ANIM mode=%s frames=%lu max_gap_ms=%lu over70=%lu\n",
-              test_active?"test":"live",(unsigned long)mascot_stats_frames,
+          Serial.printf("PICS ANIM mode=live frames=%lu max_gap_ms=%lu over70=%lu\n",
+              (unsigned long)mascot_stats_frames,
               (unsigned long)mascot_stats_max,(unsigned long)mascot_stats_slow);
         mascot_stats_at=frame_now;
         mascot_stats_frames=mascot_stats_max=mascot_stats_slow=0;

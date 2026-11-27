@@ -3,7 +3,7 @@
 
 namespace daily_alarm {
 constexpr uint16_t enabled_bit = 0x8000;
-constexpr int default_minutes = 8 * 60;
+constexpr int default_minutes = 7 * 60;
 
 constexpr int wrap(int value, int count) { return (value + count) % count; }
 constexpr int set_hour(int minutes, int delta) {

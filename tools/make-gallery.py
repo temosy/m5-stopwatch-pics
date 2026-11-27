@@ -11,20 +11,31 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageOps
 
 
-MAX_JPEG_BYTES = 1_350_000
-
-
-def rounded_jpeg(source: Image.Image, size: tuple[int, int], quality: int = 86) -> bytes:
+def rounded_jpeg(source: Image.Image, size: tuple[int, int], quality: int = 90,
+                 subsampling: int = 0) -> bytes:
     w, h = size
-    mask = Image.new("L", (w * 3, h * 3), 0)
-    radius = max(1, min(round(min(w, h) * 0.105), w // 2, h // 2))
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w * 3 - 1, h * 3 - 1),
-                                            radius * 3, fill=255)
-    mask = mask.resize(size, Image.Resampling.LANCZOS)
-    picture = Image.new("RGB", size)
-    picture.paste(source.resize(size, Image.Resampling.LANCZOS), (0, 0), mask)
-    jpeg = io.BytesIO()
-    picture.save(jpeg, format="JPEG", quality=quality, optimize=True, progressive=False)
+    radius = max(2, min(round(min(w, h) * 0.025), w // 2, h // 2))
+    grid = 8
+    offsets = [(v+0.5)/grid for v in range(grid)]
+    block = Image.new("L", (radius,radius))
+    coverage = []
+    for y in range(radius):
+        for x in range(radius):
+            inside = sum((x+dx-radius)**2+(y+dy-radius)**2 <= radius**2
+                         for dy in offsets for dx in offsets)
+            coverage.append(round(255*inside/(grid*grid)))
+    assert 0 in coverage and 255 in coverage and any(0<v<255 for v in coverage)
+    block.putdata(coverage)
+    mask=Image.new("L",size,255)
+    mask.paste(block,(0,0))
+    mask.paste(block.transpose(Image.Transpose.FLIP_LEFT_RIGHT),(w-radius,0))
+    mask.paste(block.transpose(Image.Transpose.FLIP_TOP_BOTTOM),(0,h-radius))
+    mask.paste(block.transpose(Image.Transpose.ROTATE_180),(w-radius,h-radius))
+    picture=Image.new("RGB",size)
+    picture.paste(source.resize(size,Image.Resampling.LANCZOS),(0,0),mask)
+    jpeg=io.BytesIO()
+    picture.save(jpeg,format="JPEG",quality=quality,optimize=True,
+                 progressive=False,subsampling=subsampling)
     return jpeg.getvalue()
 
 
@@ -35,8 +46,8 @@ def make_photo(path: Path) -> tuple[bytes, bytes, bytes, int, int]:
     scale = min(416 / math.hypot(w, h), 390 / h)
     nw, nh = (max(2, int(x * scale) // 2 * 2) for x in (w, h))
     return (rounded_jpeg(image, (nw, nh)),
-            rounded_jpeg(image, (nw * 2, nh * 2)),
-            rounded_jpeg(image, (nw * 4, nh * 4), quality=78), nw, nh)
+            b"",  # 2x uses the same image as 4x to fit the app partition.
+            rounded_jpeg(image, (nw * 4, nh * 4), quality=79, subsampling=2), nw, nh)
 
 
 def main() -> None:
@@ -57,25 +68,24 @@ def main() -> None:
 
     photos = [make_photo(path) for path in args.images]
     jpeg_bytes = sum(len(n) + len(z) + len(z4) for n, z, z4, _, _ in photos)
-    if jpeg_bytes > MAX_JPEG_BYTES:
-        parser.error(f"photos use {jpeg_bytes:,} JPEG bytes; limit is {MAX_JPEG_BYTES:,}. "
-                     "Try again with fewer photos.")
+    if jpeg_bytes > 850_000:
+        parser.error("encoded photos exceed 850,000 bytes; use fewer photos")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="ascii", dir=args.output.parent, delete=False
     ) as output:
         tmp = Path(output.name)
         try:
-            print("#pragma once\n#define PICS_PHOTO_GALLERY_FORMAT 2\n// Local image bytes. Do not commit.\nnamespace gallery {", file=output)
+            print("#pragma once\n// Local image bytes. Do not commit.\nnamespace gallery {", file=output)
             for index, (normal, zoom, zoom4, _, _) in enumerate(photos):
-                for tag, data in (("jpeg", normal), ("zoom", zoom), ("zoom4", zoom4)):
+                for tag, data in (("jpeg", normal), ("zoom4", zoom4)):
                     print(f"inline constexpr uint8_t {tag}_{index}[] = {{", file=output)
                     for start in range(0, len(data), 16):
                         print("  " + ",".join(f"0x{x:02x}" for x in data[start:start + 16]) + ",", file=output)
                     print("};", file=output)
             print("inline constexpr Photo photos[] = {", file=output)
             for index, (_, _, _, w, h) in enumerate(photos):
-                print(f"  {{jpeg_{index}, sizeof(jpeg_{index}), {w}, {h}, zoom_{index}, sizeof(zoom_{index}), zoom4_{index}, sizeof(zoom4_{index})}},", file=output)
+                print(f"  {{jpeg_{index}, sizeof(jpeg_{index}), {w}, {h}, zoom4_{index}, sizeof(zoom4_{index}), zoom4_{index}, sizeof(zoom4_{index})}},", file=output)
             print("};\ninline constexpr int photo_count = sizeof(photos) / sizeof(photos[0]);\n}", file=output)
             output.flush()
             os.replace(tmp, args.output)
